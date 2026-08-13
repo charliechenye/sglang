@@ -51,7 +51,7 @@ import functools
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -453,6 +453,12 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    # Process-level cleanup callbacks. Owners register callbacks when they
+    # allocate distributed resources whose lifetime must end before process
+    # group teardown.
+    distributed_resource_cleanups: list[Callable[[], None]] = dataclasses.field(
+        default_factory=list
+    )
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
@@ -1119,6 +1125,38 @@ def get_resources() -> Resources:
     return _CONTEXT.resources
 
 
+def register_distributed_resource_cleanup(cleanup: Callable[[], None]) -> None:
+    """Register a callback that releases a distributed resource.
+
+    Callbacks execute before distributed process-group teardown, in LIFO order.
+    A failing callback remains registered, errors propagate, and successful
+    callbacks are removed.  ``reset_context`` invokes the same cleanup for
+    unit-test and process-context teardown.
+    """
+
+    if not callable(cleanup):
+        raise TypeError(
+            f"distributed resource cleanup must be callable, got {cleanup!r}"
+        )
+    get_resources().distributed_resource_cleanups.append(cleanup)
+
+
+def cleanup_distributed_resources() -> None:
+    """Release registered distributed resources before group teardown.
+
+    Successful callbacks are removed only after they return.  If a callback
+    raises, it and all earlier callbacks remain registered so a later retry can
+    continue cleanup.  Errors are not swallowed: group destruction must not
+    proceed after a resource cleanup failure.
+    """
+
+    resources = get_resources()
+    while resources.distributed_resource_cleanups:
+        cleanup = resources.distributed_resource_cleanups[-1]
+        cleanup()
+        resources.distributed_resource_cleanups.pop()
+
+
 def get_forward() -> ForwardFlags:
     return _CONTEXT.forward
 
@@ -1384,6 +1422,7 @@ def reset_context() -> None:
 
     Wrapper subsystems (``parallel``) hold no state and are unaffected.
     """
+    cleanup_distributed_resources()
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _adaptive_draft_token_bound.cache_clear()

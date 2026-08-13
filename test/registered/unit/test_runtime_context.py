@@ -19,11 +19,13 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
+    cleanup_distributed_resources,
     get_context,
     get_flags,
     get_parallel,
     get_server_args,
     max_speculative_num_draft_tokens,
+    register_distributed_resource_cleanup,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -624,6 +626,62 @@ class TestNamedStreams(_IsolatedServerArgs):
         get_context().set_stream("alt", object())
         reset_context()
         self.assertEqual(get_context().resources.streams, {})
+
+    def test_distributed_resource_cleanup_is_lifo_and_idempotent(self):
+        reset_context()
+        calls = []
+        register_distributed_resource_cleanup(lambda: calls.append("first"))
+        register_distributed_resource_cleanup(lambda: calls.append("second"))
+
+        cleanup_distributed_resources()
+        cleanup_distributed_resources()
+
+        self.assertEqual(calls, ["second", "first"])
+
+    def test_distributed_cleanup_failure_preserves_retry_order(self):
+        reset_context()
+        calls = []
+        should_fail = {"b": True}
+
+        def cleanup_a():
+            calls.append("a")
+
+        def cleanup_b():
+            calls.append("b")
+            if should_fail["b"]:
+                raise RuntimeError("cleanup b failed")
+
+        def cleanup_c():
+            calls.append("c")
+
+        register_distributed_resource_cleanup(cleanup_a)
+        register_distributed_resource_cleanup(cleanup_b)
+        register_distributed_resource_cleanup(cleanup_c)
+
+        with self.assertRaisesRegex(RuntimeError, "cleanup b failed"):
+            cleanup_distributed_resources()
+
+        self.assertEqual(calls, ["c", "b"])
+        self.assertEqual(
+            get_context().resources.distributed_resource_cleanups,
+            [cleanup_a, cleanup_b],
+        )
+
+        should_fail["b"] = False
+        cleanup_distributed_resources()
+
+        self.assertEqual(calls, ["c", "b", "b", "a"])
+        self.assertEqual(get_context().resources.distributed_resource_cleanups, [])
+
+    def test_reset_runs_distributed_cleanup_before_replacing_resources(self):
+        reset_context()
+        calls = []
+        register_distributed_resource_cleanup(lambda: calls.append("released"))
+
+        reset_context()
+
+        self.assertEqual(calls, ["released"])
+        self.assertEqual(get_context().resources.distributed_resource_cleanups, [])
 
     def test_capturer_slots_roundtrip_and_reset(self):
         from sglang.srt.state_capturer.indexer_topk import (

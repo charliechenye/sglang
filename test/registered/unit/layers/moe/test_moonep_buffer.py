@@ -18,7 +18,11 @@ from sglang.srt.layers.moe.token_dispatcher.moonep import (
     validate_moonep_reference_bf16_config,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import (
+    cleanup_distributed_resources,
+    get_resources,
+    reset_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -34,6 +38,13 @@ class _FakeMoonEPBuffer:
 
     def destroy(self):
         self.destroy_calls += 1
+
+
+class _FailOnceMoonEPBuffer(_FakeMoonEPBuffer):
+    def destroy(self):
+        self.destroy_calls += 1
+        if self.destroy_calls == 1:
+            raise RuntimeError("transient MoonEP destroy failure")
 
 
 def _fake_moonep_module():
@@ -114,6 +125,11 @@ class TestMoonEPBuffer(unittest.TestCase):
         )
         self.assertIs(MoonEPBuffer.get_existing_buffer(), larger_buffer)
 
+    def test_state_lookup_does_not_register_cleanup_without_a_buffer(self):
+        MoonEPBuffer._state()
+
+        self.assertEqual(get_resources().distributed_resource_cleanups, [])
+
     def test_resolves_env_defaults_and_training_safe_prefetch_slots(self):
         group = object()
 
@@ -180,6 +196,96 @@ class TestMoonEPBuffer(unittest.TestCase):
 
         self.assertEqual(buffer.destroy_calls, 1)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
+
+    def test_runtime_resource_cleanup_releases_cached_buffers(self):
+        with (
+            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=4,
+            ),
+        ):
+            buffer = MoonEPBuffer.get_moonep_buffer(
+                group=object(),
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=256,
+            )
+
+        cleanup_distributed_resources()
+
+        self.assertEqual(buffer.destroy_calls, 1)
+        self.assertIsNone(MoonEPBuffer.get_existing_buffer())
+
+    def test_runtime_cleanup_re_registers_after_same_process_reinitialization(self):
+        with (
+            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=4,
+            ),
+        ):
+            first_buffer = MoonEPBuffer.get_moonep_buffer(
+                group=object(),
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=256,
+            )
+            cleanup_distributed_resources()
+            second_buffer = MoonEPBuffer.get_moonep_buffer(
+                group=object(),
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=256,
+            )
+            cleanup_distributed_resources()
+
+        self.assertEqual(first_buffer.destroy_calls, 1)
+        self.assertEqual(second_buffer.destroy_calls, 1)
+
+    def test_destroy_failure_keeps_buffer_owned_for_retry(self):
+        group = object()
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "moonep": types.SimpleNamespace(
+                        Buffer=_FailOnceMoonEPBuffer,
+                    )
+                },
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=4,
+            ),
+        ):
+            buffer = MoonEPBuffer.get_moonep_buffer(
+                group=group,
+                hidden_size=1024,
+                router_topk=8,
+                num_experts=64,
+                num_max_dispatch_tokens_per_rank=256,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "transient MoonEP"):
+                cleanup_distributed_resources()
+
+            state = MoonEPBuffer._state()
+            self.assertIs(MoonEPBuffer.get_existing_buffer(), buffer)
+            self.assertEqual(buffer.destroy_calls, 1)
+            self.assertTrue(state.cleanup_registered)
+            self.assertEqual(len(get_resources().distributed_resource_cleanups), 1)
+
+            cleanup_distributed_resources()
+
+        self.assertEqual(buffer.destroy_calls, 2)
+        self.assertIsNone(MoonEPBuffer.get_existing_buffer())
+        self.assertFalse(MoonEPBuffer._state().cleanup_registered)
+        self.assertEqual(get_resources().distributed_resource_cleanups, [])
 
 
 class TestMoonEPExpertWeightLayout(unittest.TestCase):
