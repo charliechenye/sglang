@@ -67,7 +67,8 @@ logger = logging.getLogger(__name__)
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
-    Mooncake EP shares the same class, as they expose the same interface.
+    Mooncake EP and MoonEP share this execution skeleton while exposing
+    different dispatcher contracts.
     """
 
     _has_printed = False
@@ -101,56 +102,64 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        is_humming = (
-            get_moe_runner_backend().is_humming()
-            or get_moe_runner_backend().is_auto()
-            and quant_config is not None
-            and quant_config.get_name() == "humming"
-        )
-        if is_humming:
-            self.deprecate_flag = True
-        elif _use_aiter:
-            self.deprecate_flag = True
-        elif _is_npu:
-            self.deprecate_flag = True
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
-            quant_config, Fp8Config
-        ):
-            self.deprecate_flag = True
-        elif (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
-            self.deprecate_flag = True
-        elif (
-            get_moe_runner_backend().is_flashinfer_cutedsl()
-            and quant_config is not None
-            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
-        ):
-            self.deprecate_flag = True
-        elif (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_moe_runner_backend().is_deep_gemm()
-            and quant_config is not None
-            and quant_config.get_name() == "mxfp4"
-        ):
-            # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
-            # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
-            self.deprecate_flag = True
-        elif (
-            quant_config is None
-            and self.w13_weight.dtype == torch.bfloat16
-            and get_moe_runner_backend().is_deep_gemm()
-            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
-            and not _is_npu
-            and not _is_hip
-        ):
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), "Unquantized DeepEP MoE requires DeepGEMM BF16"
-            self.deprecate_flag = True
-        else:
+        a2a_backend = get_moe_a2a_backend()
+        self._moonep_reference_path = a2a_backend.is_moonep()
+        if self._moonep_reference_path:
+            # MoonEP is synchronous and has its own dispatch format.  Keep it
+            # on the explicit dispatch -> prefetch -> reference compute ->
+            # combine path regardless of DeepEP-only runner/environment knobs.
             self.deprecate_flag = False
+        else:
+            is_humming = (
+                get_moe_runner_backend().is_humming()
+                or get_moe_runner_backend().is_auto()
+                and quant_config is not None
+                and quant_config.get_name() == "humming"
+            )
+            if is_humming:
+                self.deprecate_flag = True
+            elif _use_aiter:
+                self.deprecate_flag = True
+            elif _is_npu:
+                self.deprecate_flag = True
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
+                quant_config, Fp8Config
+            ):
+                self.deprecate_flag = True
+            elif (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            ):
+                self.deprecate_flag = True
+            elif (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                and quant_config is not None
+                and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
+            ):
+                self.deprecate_flag = True
+            elif (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_runner_backend().is_deep_gemm()
+                and quant_config is not None
+                and quant_config.get_name() == "mxfp4"
+            ):
+                # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
+                # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
+                self.deprecate_flag = True
+            elif (
+                quant_config is None
+                and self.w13_weight.dtype == torch.bfloat16
+                and get_moe_runner_backend().is_deep_gemm()
+                and (a2a_backend.is_deepep() or a2a_backend.is_pplx())
+                and not _is_npu
+                and not _is_hip
+            ):
+                assert (
+                    deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                ), "Unquantized DeepEP MoE requires DeepGEMM BF16"
+                self.deprecate_flag = True
+            else:
+                self.deprecate_flag = False
 
         if self.deprecate_flag:
             return
@@ -318,6 +327,8 @@ class DeepEPMoE(FusedMoE):
                 dispatch_output,
                 weight_layout,
                 activation=self.moe_runner_config.activation,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
             )
         else:
             raise NotImplementedError(

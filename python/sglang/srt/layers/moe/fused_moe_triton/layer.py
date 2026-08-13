@@ -33,7 +33,11 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
-from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.layers.moe.token_dispatcher import (
+    CombineInput,
+    DispatchOutput,
+    MoonEPDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
@@ -152,7 +156,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
-        or a2a_backend.is_moonep()
         or a2a_backend.is_mooncake()
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
@@ -169,6 +172,18 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+        )
+    elif a2a_backend.is_moonep():
+        # MoonEP is a synchronous reference adapter.  Keep it out of the
+        # DeepEP TBO wrapper so async/split-phase capabilities cannot be
+        # advertised accidentally.
+        return MoonEPDispatcher(
+            group=_get_deepep_comm_group(a2a_backend),
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -408,6 +423,8 @@ class FusedMoE(torch.nn.Module):
                 num_fused_shared_experts=num_fused_shared_experts,
                 with_bias=with_bias,
                 activation=activation,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_clamp_limit=gemm1_clamp_limit,
                 quant_method=self.quant_method,
                 layer=self,
             )
