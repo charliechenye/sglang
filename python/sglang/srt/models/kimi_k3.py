@@ -8,6 +8,7 @@
 
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -140,6 +141,33 @@ _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
+
+
+@dataclass(frozen=True)
+class _KimiK3MoEBackendCapabilities:
+    """Model-level capabilities needed by the K3 MoE forward path."""
+
+    token_a2a: bool
+    shared_expert_overlap: bool
+
+
+def _get_kimi_k3_moe_backend_capabilities(
+    a2a_backend,
+) -> _KimiK3MoEBackendCapabilities:
+    """Resolve K3 semantics without treating every A2A backend as identical."""
+
+    token_a2a = (
+        a2a_backend.is_megamoe()
+        or a2a_backend.is_deepep()
+        or a2a_backend.is_ascend_fuseep()
+        or a2a_backend.is_moonep()
+    )
+    return _KimiK3MoEBackendCapabilities(
+        token_a2a=token_a2a,
+        # MoonEP's synchronous reference path has no validated K3 shared-
+        # expert stream/ownership overlap contract yet.
+        shared_expert_overlap=token_a2a and not a2a_backend.is_moonep(),
+    )
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -508,17 +536,14 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP) move each row to its experts
+        # EP a2a backends (MegaMoE / DeepEP / MoonEP) move each row to its experts
         # directly, so the MoE region can consume whatever rows this rank
         # holds — an SP-MoE token shard (attn_tp > 1) or the DP-local batch
         # (DP attention) — with every global token dispatched exactly once.
         # No DP gather and no TP reduce is needed anywhere in the region.
         _a2a_backend = get_moe_a2a_backend()
-        self._ep_a2a = (
-            _a2a_backend.is_megamoe()
-            or _a2a_backend.is_deepep()
-            or _a2a_backend.is_ascend_fuseep()
-        )
+        backend_capabilities = _get_kimi_k3_moe_backend_capabilities(_a2a_backend)
+        self._ep_a2a = backend_capabilities.token_a2a
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
@@ -536,12 +561,18 @@ class KimiK3MoE(nn.Module):
         # a2a: the block runs on partial batches (shard / DP-local rows), and
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
-        self._shared_experts_tp1 = self._ep_a2a and not _k3_shared_experts_attn_tp
+        # MoonEP is validated only with replicated (TP1) shared experts.  Do
+        # not let the NPU compatibility knob select a different ownership
+        # layout for the CUDA reference path.
+        use_shared_experts_attn_tp = (
+            _k3_shared_experts_attn_tp and not _a2a_backend.is_moonep()
+        )
+        self._shared_experts_tp1 = self._ep_a2a and not use_shared_experts_attn_tp
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
         self._shared_experts_attn_tp_comm = (
-            _k3_shared_experts_attn_tp
+            use_shared_experts_attn_tp
             and self._ep_a2a
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
@@ -580,11 +611,11 @@ class KimiK3MoE(nn.Module):
         # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
         # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
         # no flag.
-        # EP a2a only: with plain-TP experts the fused front already lands both
-        # partial sums in one collective (_forward_fused), a strictly better
-        # overlap than two streams.
+        # The reference MoonEP path deliberately does not opt into this
+        # overlap: its synchronous dispatcher has no validated shared-expert
+        # stream/ownership contract.
         self._sbo_shared_overlap = (
-            self._ep_a2a
+            backend_capabilities.shared_expert_overlap
             and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
@@ -2105,7 +2136,7 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe or DeepEP): o_proj defers its
+        # SP-MoE (EP a2a backend — MegaMoE, DeepEP, or MoonEP): o_proj defers its
         # attention-TP reduction; this layer completes it as a reduce-scatter
         # so the whole MoE region (agg2, norms, gate, latent projs, tp1
         # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
@@ -2124,11 +2155,7 @@ class KimiK3DecoderLayer(nn.Module):
         # token shard.
         _a2a_backend = get_moe_a2a_backend()
         self._sp_moe = (
-            (
-                _a2a_backend.is_megamoe()
-                or _a2a_backend.is_deepep()
-                or _a2a_backend.is_ascend_fuseep()
-            )
+            _get_kimi_k3_moe_backend_capabilities(_a2a_backend).token_a2a
             and self._is_moe_layer
             and get_parallel().attn_tp_group.world_size > 1
         )
