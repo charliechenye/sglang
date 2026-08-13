@@ -223,9 +223,26 @@ class MoonEPBuffer:
             state = SimpleNamespace(
                 buffers={},
                 active_key=None,
+                cleanup_registered=False,
             )
             buffers["moonep_ep_state"] = state
         return state
+
+    @classmethod
+    def _ensure_cleanup_registered(cls, state) -> None:
+        from sglang.srt.runtime_context import (
+            register_distributed_resource_cleanup,
+        )
+
+        if state.cleanup_registered:
+            return
+
+        def cleanup_moonep_buffers() -> None:
+            cls.destroy_all_buffers()
+            state.cleanup_registered = False
+
+        register_distributed_resource_cleanup(cleanup_moonep_buffers)
+        state.cleanup_registered = True
 
     @staticmethod
     def _require_positive_int(name: str, value: int) -> int:
@@ -380,6 +397,17 @@ class MoonEPBuffer:
         )
         state.buffers[key] = buffer
         state.active_key = key
+        try:
+            cls._ensure_cleanup_registered(state)
+        except Exception:
+            try:
+                cls.destroy_buffer(key)
+            except Exception as destroy_exc:
+                raise RuntimeError(
+                    "MoonEP buffer was allocated but cleanup registration failed, "
+                    "and destroying the new buffer also failed."
+                ) from destroy_exc
+            raise
         return buffer
 
     @classmethod
@@ -390,10 +418,13 @@ class MoonEPBuffer:
         if key is None:
             return
 
-        buffer = state.buffers.pop(key, None)
+        buffer = state.buffers.get(key)
+        if buffer is None:
+            return
         destroy = getattr(buffer, "destroy", None)
         if callable(destroy):
             destroy()
+        state.buffers.pop(key, None)
         if state.active_key == key:
             state.active_key = next(reversed(state.buffers), None)
 
@@ -402,7 +433,8 @@ class MoonEPBuffer:
         state = cls._state()
         for key in list(state.buffers):
             cls.destroy_buffer(key)
-        state.active_key = None
+        if not state.buffers:
+            state.active_key = None
 
 
 def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:

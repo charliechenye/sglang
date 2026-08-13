@@ -51,6 +51,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    cleanup_distributed_resources,
     get_global_dwdp_manager,
     set_global_dwdp_manager,
 )
@@ -2856,6 +2857,7 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    cleanup_distributed_resources()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()
@@ -2909,6 +2911,7 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
+    cleanup_distributed_resources()
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
     if _WORLD:
         _WORLD.destroy()
