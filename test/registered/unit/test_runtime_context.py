@@ -627,17 +627,6 @@ class TestNamedStreams(_IsolatedServerArgs):
         reset_context()
         self.assertEqual(get_context().resources.streams, {})
 
-    def test_distributed_resource_cleanup_is_lifo_and_idempotent(self):
-        reset_context()
-        calls = []
-        register_distributed_resource_cleanup(lambda: calls.append("first"))
-        register_distributed_resource_cleanup(lambda: calls.append("second"))
-
-        cleanup_distributed_resources()
-        cleanup_distributed_resources()
-
-        self.assertEqual(calls, ["second", "first"])
-
     def test_distributed_cleanup_failure_preserves_retry_order(self):
         reset_context()
         calls = []
@@ -672,6 +661,9 @@ class TestNamedStreams(_IsolatedServerArgs):
 
         self.assertEqual(calls, ["c", "b", "b", "a"])
         self.assertEqual(get_context().resources.distributed_resource_cleanups, [])
+
+        cleanup_distributed_resources()
+        self.assertEqual(calls, ["c", "b", "b", "a"])
 
     def test_reset_runs_distributed_cleanup_before_replacing_resources(self):
         reset_context()

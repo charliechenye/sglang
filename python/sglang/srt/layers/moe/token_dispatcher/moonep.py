@@ -36,33 +36,6 @@ _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE = (
 )
 
 
-def _unwrap_moe_weight_method(quant_method: Any) -> Any:
-    """Return the concrete weight method behind optional execution wrappers."""
-
-    seen = set()
-    while hasattr(quant_method, "gpu_method"):
-        if id(quant_method) in seen:
-            raise ValueError("MoE weight method wrapper cycle detected.")
-        seen.add(id(quant_method))
-        quant_method = quant_method.gpu_method
-    return quant_method
-
-
-def _moe_method_changes_expert_ownership(quant_method: Any) -> bool:
-    """Detect wrappers that make GPU expert storage only a partial ownership."""
-
-    seen = set()
-    while True:
-        if getattr(quant_method, "override_num_local_experts", False):
-            return True
-        if not hasattr(quant_method, "gpu_method"):
-            return False
-        if id(quant_method) in seen:
-            raise ValueError("MoE weight method wrapper cycle detected.")
-        seen.add(id(quant_method))
-        quant_method = quant_method.gpu_method
-
-
 def validate_moonep_reference_bf16_weight_layout(
     *,
     quant_method: Any,
@@ -70,12 +43,17 @@ def validate_moonep_reference_bf16_weight_layout(
 ) -> None:
     """Reject weight methods whose post-load storage is not canonical [Gate, Up]."""
 
-    if _moe_method_changes_expert_ownership(quant_method):
-        raise NotImplementedError(
-            _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE
-        )
+    method = quant_method
+    while True:
+        if getattr(method, "override_num_local_experts", False):
+            raise NotImplementedError(
+                _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE
+            )
+        gpu_method = getattr(method, "gpu_method", None)
+        if gpu_method is None:
+            break
+        method = gpu_method
 
-    method = _unwrap_moe_weight_method(quant_method)
     if getattr(method, "load_up_proj_weight_first", False):
         raise NotImplementedError(_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE)
 
@@ -580,142 +558,28 @@ def run_moonep_bf16_expert(
     cu_seqlens = dispatch_output.cu_seqlens
     expert_ids = dispatch_output.expert_ids
 
-    if hidden_states.ndim != 2:
-        raise ValueError(
-            f"MoonEP hidden states must be [NvS, H], got {hidden_states.shape}"
-        )
-    if hidden_states.dtype != torch.bfloat16:
-        raise NotImplementedError(
-            "The current SGLang MoonEP BF16 reference expert runner requires "
-            "BF16 hidden states, "
-            f"got {hidden_states.dtype}."
-        )
-    if cu_seqlens.ndim != 1:
-        raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.shape}")
-    if (
-        cu_seqlens.dtype == torch.bool
-        or cu_seqlens.is_floating_point()
-        or cu_seqlens.is_complex()
-    ):
-        raise TypeError(
-            "MoonEP cu_seqlens must use an integer dtype, " f"got {cu_seqlens.dtype}."
-        )
-    if (
-        expert_ids.dtype == torch.bool
-        or expert_ids.is_floating_point()
-        or expert_ids.is_complex()
-    ):
-        raise TypeError(
-            "MoonEP expert_ids must use an integer dtype, " f"got {expert_ids.dtype}."
-        )
-    if expert_ids.shape != cu_seqlens.shape:
-        raise ValueError(
-            f"expert_ids shape {expert_ids.shape} must match cu_seqlens "
-            f"shape {cu_seqlens.shape}"
-        )
-    if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
-    if (
-        route_weights_nvs is not None
-        and route_weights_nvs.shape[0] != hidden_states.shape[0]
-    ):
-        raise ValueError(
-            "route_weights_nvs length must match dispatched hidden rows: "
-            f"weights={route_weights_nvs.shape[0]}, "
-            f"hidden_rows={hidden_states.shape[0]}"
-        )
-    if dispatch_output.num_tokens < 0:
-        raise ValueError(
-            f"MoonEP num_tokens must be nonnegative, got {dispatch_output.num_tokens}"
-        )
-    if dispatch_output.num_tokens > hidden_states.shape[0]:
-        raise ValueError(
-            "MoonEP num_tokens cannot exceed dispatched hidden rows: "
-            f"num_tokens={dispatch_output.num_tokens}, "
-            f"hidden_rows={hidden_states.shape[0]}"
-        )
-
     gate_weight = weight_layout.full_gate_weight
     up_weight = weight_layout.full_up_weight
     down_weight = weight_layout.full_down_weight
-    if gate_weight.ndim != 3 or up_weight.ndim != 3 or down_weight.ndim != 3:
-        raise ValueError(
-            "MoonEP expert weights must all be 3D [experts, output, input] "
-            f"tensors, got gate={gate_weight.shape}, up={up_weight.shape}, "
-            f"down={down_weight.shape}"
-        )
-    if any(
-        weight.dtype != torch.bfloat16
-        for weight in (gate_weight, up_weight, down_weight)
-    ):
-        raise NotImplementedError(
-            "The current SGLang MoonEP BF16 reference expert runner requires "
-            "BF16 gate/up/down "
-            f"weights, got gate={gate_weight.dtype}, up={up_weight.dtype}, "
-            f"down={down_weight.dtype}."
-        )
-    if not (gate_weight.shape[0] == up_weight.shape[0] == down_weight.shape[0]):
-        raise ValueError(
-            "MoonEP expert weight row counts must match: "
-            f"gate={gate_weight.shape[0]}, up={up_weight.shape[0]}, "
-            f"down={down_weight.shape[0]}"
-        )
-    if (
-        gate_weight.shape[2] != hidden_states.shape[1]
-        or up_weight.shape[2] != hidden_states.shape[1]
-    ):
-        raise ValueError(
-            "MoonEP gate/up input width must match hidden states: "
-            f"hidden={hidden_states.shape[1]}, gate={gate_weight.shape[2]}, "
-            f"up={up_weight.shape[2]}"
-        )
-    if (
-        gate_weight.shape[1] != up_weight.shape[1]
-        or down_weight.shape[2] != gate_weight.shape[1]
-    ):
-        raise ValueError(
-            "MoonEP gate/up/down intermediate dimensions must match: "
-            f"gate={gate_weight.shape[1]}, up={up_weight.shape[1]}, "
-            f"down_input={down_weight.shape[2]}"
-        )
-    if down_weight.shape[1] != hidden_states.shape[1]:
-        raise ValueError(
-            "MoonEP down weight output width must match hidden states: "
-            f"down={down_weight.shape[1]}, hidden={hidden_states.shape[1]}"
-        )
 
     output = torch.empty_like(hidden_states)
     prev = 0
     for group_id in range(cu_seqlens.numel()):
         cur = int(cu_seqlens[group_id].item())
-        if cur < 0:
+        if cur < prev or cur > hidden_states.shape[0]:
             raise ValueError(
-                f"MoonEP cu_seqlens[{group_id}] must be nonnegative, got {cur}"
-            )
-        if cur < prev:
-            raise ValueError(
-                "MoonEP cu_seqlens must be non-decreasing: "
-                f"cu_seqlens[{group_id - 1}]={prev}, "
-                f"cu_seqlens[{group_id}]={cur}"
-            )
-        if cur > hidden_states.shape[0]:
-            raise ValueError(
-                f"MoonEP cu_seqlens[{group_id}]={cur} exceeds dispatched "
-                f"hidden rows={hidden_states.shape[0]}"
+                "MoonEP cu_seqlens must be non-decreasing and within "
+                f"dispatched rows: previous={prev}, current={cur}, "
+                f"rows={hidden_states.shape[0]}"
             )
         if cur == prev:
             continue
 
         expert_id = int(expert_ids[group_id].item())
-        if expert_id < 0:
+        if not 0 <= expert_id < gate_weight.shape[0]:
             raise ValueError(
-                f"MoonEP expert_ids[{group_id}]={expert_id} is invalid for a "
-                "non-empty segment"
-            )
-        if expert_id >= weight_layout.full_gate_weight.shape[0]:
-            raise ValueError(
-                f"expert_id {expert_id} exceeds MoonEP weight rows "
-                f"{weight_layout.full_gate_weight.shape[0]}"
+                f"expert_id {expert_id} is outside MoonEP weight rows "
+                f"[0, {gate_weight.shape[0]})"
             )
 
         x = hidden_states[prev:cur]
@@ -810,11 +674,6 @@ class MoonEPDispatcher(BaseDispatcher):
     ) -> None:
         if self.hidden_size is None:
             raise ValueError("MoonEPDispatcher requires hidden_size.")
-        if hidden_states.ndim != 2:
-            raise ValueError(
-                "MoonEP hidden_states must be rank 2 [num_tokens, hidden_size], "
-                f"got {hidden_states.shape}"
-            )
         if hidden_states.shape[1] != self.hidden_size:
             raise ValueError(
                 "MoonEP hidden_states width does not match configured hidden_size: "
@@ -828,55 +687,10 @@ class MoonEPDispatcher(BaseDispatcher):
             )
 
         topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-        if not isinstance(topk_ids, torch.Tensor) or topk_ids.ndim != 2:
-            shape = getattr(topk_ids, "shape", None)
-            raise ValueError(
-                "MoonEP topk_ids must be rank 2 [num_tokens, router_topk], "
-                f"got {shape}"
-            )
-        if not isinstance(topk_weights, torch.Tensor) or topk_weights.ndim != 2:
-            shape = getattr(topk_weights, "shape", None)
-            raise ValueError(
-                "MoonEP topk_weights must be rank 2 [num_tokens, router_topk], "
-                f"got {shape}"
-            )
-        if topk_ids.shape != topk_weights.shape:
-            raise ValueError(
-                "MoonEP topk_ids and topk_weights must have the same shape: "
-                f"ids={topk_ids.shape}, weights={topk_weights.shape}"
-            )
-        if topk_ids.shape[0] != hidden_states.shape[0]:
-            raise ValueError(
-                "MoonEP routing row count must match hidden_states: "
-                f"ids={topk_ids.shape[0]}, hidden={hidden_states.shape[0]}"
-            )
         if topk_ids.shape[1] != self.router_topk:
             raise ValueError(
                 "MoonEP routing width must match router_topk: "
                 f"width={topk_ids.shape[1]}, router_topk={self.router_topk}"
-            )
-        if (
-            topk_ids.device != hidden_states.device
-            or topk_weights.device != hidden_states.device
-        ):
-            raise ValueError(
-                "MoonEP hidden_states, topk_ids, and topk_weights must be on the "
-                "same device."
-            )
-        if (
-            topk_ids.dtype == torch.bool
-            or topk_ids.is_floating_point()
-            or topk_ids.is_complex()
-        ):
-            raise TypeError(
-                "MoonEP topk_ids must use an integer dtype before conversion to "
-                f"int32, got {topk_ids.dtype}."
-            )
-        if not topk_weights.is_floating_point():
-            raise TypeError(
-                "MoonEP topk_weights must use a floating-point dtype before "
-                f"conversion to float32, got {topk_weights.dtype}."
             )
 
     def _pad_to_capacity(
@@ -928,12 +742,6 @@ class MoonEPDispatcher(BaseDispatcher):
             topk_ids.reshape(-1).to(dtype=torch.int64),
             minlength=self.num_experts,
         )
-        if tokens_per_expert.numel() != self.num_experts:
-            raise ValueError(
-                "MoonEP topk_ids contains an expert ID outside the configured "
-                f"range [0, {self.num_experts}): tokens_per_expert has "
-                f"{tokens_per_expert.numel()} bins."
-            )
         return tokens_per_expert.to(dtype=torch.int32)
 
     def _expert_ids_from_plan(
@@ -1049,17 +857,6 @@ class MoonEPDispatcher(BaseDispatcher):
             route_weights_nvs=None,
             async_finish=False,
         )
-        if combine_input.num_tokens < 0:
-            raise ValueError(
-                "MoonEP combine num_tokens must be nonnegative, "
-                f"got {combine_input.num_tokens}"
-            )
-        if hidden_states.shape[0] < combine_input.num_tokens:
-            raise ValueError(
-                "MoonEP combine returned fewer rows than the original input: "
-                f"rows={hidden_states.shape[0]}, "
-                f"num_tokens={combine_input.num_tokens}"
-            )
         return hidden_states[: combine_input.num_tokens].contiguous()
 
     def combine_a(

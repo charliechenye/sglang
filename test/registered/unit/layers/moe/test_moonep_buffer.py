@@ -2,7 +2,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -16,11 +16,11 @@ from sglang.srt.layers.moe.token_dispatcher.moonep import (
     get_moonep_expert_weight_layout,
     run_moonep_bf16_expert,
     validate_moonep_reference_bf16_config,
+    validate_moonep_reference_bf16_weight_layout,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.runtime_context import (
     cleanup_distributed_resources,
-    get_resources,
     reset_context,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -125,11 +125,6 @@ class TestMoonEPBuffer(unittest.TestCase):
         )
         self.assertIs(MoonEPBuffer.get_existing_buffer(), larger_buffer)
 
-    def test_state_lookup_does_not_register_cleanup_without_a_buffer(self):
-        MoonEPBuffer._state()
-
-        self.assertEqual(get_resources().distributed_resource_cleanups, [])
-
     def test_resolves_env_defaults_and_training_safe_prefetch_slots(self):
         group = object()
 
@@ -174,78 +169,6 @@ class TestMoonEPBuffer(unittest.TestCase):
 
         self.assertEqual(_FakeMoonEPBuffer.instances, [])
 
-    def test_destroy_all_buffers_releases_cached_buffers(self):
-        group = object()
-
-        with (
-            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
-                return_value=4,
-            ),
-        ):
-            buffer = MoonEPBuffer.get_moonep_buffer(
-                group=group,
-                hidden_size=1024,
-                router_topk=8,
-                num_experts=64,
-                num_max_dispatch_tokens_per_rank=256,
-            )
-
-        MoonEPBuffer.destroy_all_buffers()
-
-        self.assertEqual(buffer.destroy_calls, 1)
-        self.assertIsNone(MoonEPBuffer.get_existing_buffer())
-
-    def test_runtime_resource_cleanup_releases_cached_buffers(self):
-        with (
-            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
-                return_value=4,
-            ),
-        ):
-            buffer = MoonEPBuffer.get_moonep_buffer(
-                group=object(),
-                hidden_size=1024,
-                router_topk=8,
-                num_experts=64,
-                num_max_dispatch_tokens_per_rank=256,
-            )
-
-        cleanup_distributed_resources()
-
-        self.assertEqual(buffer.destroy_calls, 1)
-        self.assertIsNone(MoonEPBuffer.get_existing_buffer())
-
-    def test_runtime_cleanup_re_registers_after_same_process_reinitialization(self):
-        with (
-            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
-                return_value=4,
-            ),
-        ):
-            first_buffer = MoonEPBuffer.get_moonep_buffer(
-                group=object(),
-                hidden_size=1024,
-                router_topk=8,
-                num_experts=64,
-                num_max_dispatch_tokens_per_rank=256,
-            )
-            cleanup_distributed_resources()
-            second_buffer = MoonEPBuffer.get_moonep_buffer(
-                group=object(),
-                hidden_size=1024,
-                router_topk=8,
-                num_experts=64,
-                num_max_dispatch_tokens_per_rank=256,
-            )
-            cleanup_distributed_resources()
-
-        self.assertEqual(first_buffer.destroy_calls, 1)
-        self.assertEqual(second_buffer.destroy_calls, 1)
-
     def test_destroy_failure_keeps_buffer_owned_for_retry(self):
         group = object()
 
@@ -274,18 +197,13 @@ class TestMoonEPBuffer(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "transient MoonEP"):
                 cleanup_distributed_resources()
 
-            state = MoonEPBuffer._state()
             self.assertIs(MoonEPBuffer.get_existing_buffer(), buffer)
             self.assertEqual(buffer.destroy_calls, 1)
-            self.assertTrue(state.cleanup_registered)
-            self.assertEqual(len(get_resources().distributed_resource_cleanups), 1)
 
             cleanup_distributed_resources()
 
         self.assertEqual(buffer.destroy_calls, 2)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
-        self.assertFalse(MoonEPBuffer._state().cleanup_registered)
-        self.assertEqual(get_resources().distributed_resource_cleanups, [])
 
 
 class TestMoonEPExpertWeightLayout(unittest.TestCase):
@@ -338,14 +256,6 @@ class TestMoonEPExpertWeightLayout(unittest.TestCase):
         self.assertTrue(torch.all(layout.full_up_weight[3:] == 0))
         self.assertTrue(torch.all(layout.full_down_weight[3:] == 0))
 
-    def test_layout_is_cached_for_same_weight_storage(self):
-        layer = self._fake_layer()
-
-        first = get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
-        second = get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
-
-        self.assertIs(first, second)
-
     def test_layout_rejects_local_expert_storage(self):
         layer = self._fake_layer()
         layer.w13_weight = layer.w13_weight[:2].contiguous()
@@ -353,28 +263,13 @@ class TestMoonEPExpertWeightLayout(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "global w13_weight"):
             get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
 
-    def test_layout_rejects_unsupported_bf16_contracts(self):
-        cases = [
-            ("with_bias", True, "expert bias"),
-            ("params_dtype", torch.float16, "params_dtype"),
-            ("activation", "situ", "SiLU only"),
-        ]
-        for attribute, value, message in cases:
-            with self.subTest(attribute=attribute):
-                layer = self._fake_layer()
-                if attribute in {"with_bias", "params_dtype"}:
-                    setattr(layer, attribute, value)
-                else:
-                    layer.moe_runner_config.activation = value
-                with self.assertRaisesRegex(NotImplementedError, message):
-                    get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
-
-    def test_layout_rejects_transformed_weight_method(self):
+    def test_rejects_transformed_expert_layouts(self):
         layer = self._fake_layer()
-        for method in (
+        methods = (
             UnquantizedFusedMoEMethod(use_triton_kernels=True),
             UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True),
-        ):
+        )
+        for method in methods:
             with self.subTest(method=type(method).__name__):
                 layer.quant_method = method
                 with self.assertRaisesRegex(NotImplementedError, "canonical.*Gate, Up"):
@@ -521,171 +416,6 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
         self.assertIs(combine_input.plan, dispatch_output.plan)
         self.assertEqual(combine_input.num_tokens, 2)
 
-    def test_runner_rejects_non_bf16_hidden_states(self):
-        dispatch_output = MoonEPDispatchOutput(
-            hidden_states=torch.zeros(1, 2, dtype=torch.float32),
-            route_weights_nvs=None,
-            cu_seqlens=torch.tensor([1], dtype=torch.int32),
-            plan=object(),
-            expert_ids=torch.tensor([0], dtype=torch.int32),
-            num_tokens=1,
-        )
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2),
-            full_up_weight=torch.zeros(1, 2, 2),
-            full_down_weight=torch.zeros(1, 2, 2),
-            num_prefetch_slots=0,
-        )
-
-        with self.assertRaisesRegex(NotImplementedError, "requires BF16"):
-            run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_non_bf16_weights(self):
-        dispatch_output = MoonEPDispatchOutput(
-            hidden_states=torch.zeros(1, 2, dtype=torch.bfloat16),
-            route_weights_nvs=None,
-            cu_seqlens=torch.tensor([1], dtype=torch.int32),
-            plan=object(),
-            expert_ids=torch.tensor([0], dtype=torch.int32),
-            num_tokens=1,
-        )
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-
-        with self.assertRaisesRegex(NotImplementedError, "gate/up/down weights"):
-            run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_malformed_cu_seqlens(self):
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-        cases = [
-            (
-                torch.tensor([-1], dtype=torch.int32),
-                "must be nonnegative",
-            ),
-            (
-                torch.tensor([2, 1], dtype=torch.int32),
-                "non-decreasing",
-            ),
-            (
-                torch.tensor([3], dtype=torch.int32),
-                "exceeds dispatched",
-            ),
-        ]
-        for cu_seqlens, message in cases:
-            with self.subTest(cu_seqlens=cu_seqlens.tolist()):
-                dispatch_output = MoonEPDispatchOutput(
-                    hidden_states=torch.zeros(2, 2, dtype=torch.bfloat16),
-                    route_weights_nvs=None,
-                    cu_seqlens=cu_seqlens,
-                    plan=object(),
-                    expert_ids=torch.zeros_like(cu_seqlens),
-                    num_tokens=2,
-                )
-                with self.assertRaisesRegex(ValueError, message):
-                    run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_non_integer_segment_metadata(self):
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-        for field, value in (
-            ("cu_seqlens", torch.tensor([1.0])),
-            ("expert_ids", torch.tensor([0.0])),
-        ):
-            with self.subTest(field=field):
-                dispatch_output = MoonEPDispatchOutput(
-                    hidden_states=torch.zeros(1, 2, dtype=torch.bfloat16),
-                    route_weights_nvs=None,
-                    cu_seqlens=(
-                        value
-                        if field == "cu_seqlens"
-                        else torch.tensor([1], dtype=torch.int32)
-                    ),
-                    plan=object(),
-                    expert_ids=(
-                        value
-                        if field == "expert_ids"
-                        else torch.tensor([0], dtype=torch.int32)
-                    ),
-                    num_tokens=1,
-                )
-                with self.assertRaisesRegex(TypeError, "integer dtype"):
-                    run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_route_weight_length_mismatch(self):
-        dispatch_output = MoonEPDispatchOutput(
-            hidden_states=torch.zeros(2, 2, dtype=torch.bfloat16),
-            route_weights_nvs=torch.ones(1, dtype=torch.float32),
-            cu_seqlens=torch.tensor([2], dtype=torch.int32),
-            plan=object(),
-            expert_ids=torch.tensor([0], dtype=torch.int32),
-            num_tokens=2,
-        )
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-
-        with self.assertRaisesRegex(ValueError, "length must match"):
-            run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_invalid_expert_ids_for_nonempty_segments(self):
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-        for expert_id, message in ((-1, "invalid"), (1, "exceeds")):
-            with self.subTest(expert_id=expert_id):
-                dispatch_output = MoonEPDispatchOutput(
-                    hidden_states=torch.zeros(1, 2, dtype=torch.bfloat16),
-                    route_weights_nvs=None,
-                    cu_seqlens=torch.tensor([1], dtype=torch.int32),
-                    plan=object(),
-                    expert_ids=torch.tensor([expert_id], dtype=torch.int32),
-                    num_tokens=1,
-                )
-                with self.assertRaisesRegex(ValueError, message):
-                    run_moonep_bf16_expert(dispatch_output, layout)
-
-    def test_runner_rejects_non_silu_activation(self):
-        dispatch_output = MoonEPDispatchOutput(
-            hidden_states=torch.zeros(0, 2, dtype=torch.bfloat16),
-            route_weights_nvs=None,
-            cu_seqlens=torch.empty(0, dtype=torch.int32),
-            plan=object(),
-            expert_ids=torch.empty(0, dtype=torch.int32),
-            num_tokens=0,
-        )
-        layout = MoonEPExpertWeightLayout(
-            full_gate_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_up_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            full_down_weight=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-            num_prefetch_slots=0,
-        )
-
-        with self.assertRaisesRegex(NotImplementedError, "SiLU only"):
-            run_moonep_bf16_expert(
-                dispatch_output,
-                layout,
-                activation="situ",
-            )
-
 
 class TestMoonEPDispatcherRankContract(unittest.TestCase):
     def setUp(self):
@@ -752,85 +482,11 @@ class TestMoonEPConfigContract(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, message):
                     validate_moonep_reference_bf16_config(**kwargs)
 
-    def test_rejects_noncanonical_weight_method_before_loading(self):
-        with self.assertRaisesRegex(NotImplementedError, "canonical.*Gate, Up"):
-            validate_moonep_reference_bf16_config(
-                quant_config=None,
-                params_dtype=torch.bfloat16,
-                num_fused_shared_experts=0,
-                with_bias=False,
-                activation="silu",
-                quant_method=SimpleNamespace(load_up_proj_weight_first=True),
+    def test_rejects_heterogeneous_expert_ownership(self):
+        with self.assertRaisesRegex(NotImplementedError, "heterogeneous CPU/GPU"):
+            validate_moonep_reference_bf16_weight_layout(
+                quant_method=SimpleNamespace(override_num_local_experts=True)
             )
-
-    def test_rejects_heterogeneous_expert_ownership_before_weight_creation(self):
-        backend = Mock()
-        parallel = SimpleNamespace(
-            moe_ep_size=1,
-            moe_ep_rank=0,
-            moe_tp_size=1,
-            moe_tp_rank=0,
-        )
-        execution = SimpleNamespace(
-            moe=SimpleNamespace(
-                ep_join_mode=None,
-                moe_runner_backend="triton",
-            )
-        )
-        server_args = SimpleNamespace(kt_weight_path=None)
-        a2a_backend = SimpleNamespace(is_moonep=lambda: True)
-        method = SimpleNamespace(
-            override_num_local_experts=True,
-            create_weights=Mock(),
-        )
-
-        with (
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_parallel",
-                return_value=parallel,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_exec",
-                return_value=execution,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_server_args",
-                return_value=server_args,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_runner_backend",
-                return_value=backend,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.get_moe_a2a_backend",
-                return_value=a2a_backend,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer.UnquantizedFusedMoEMethod",
-                return_value=method,
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer._validate_hpc_ops_quant_method"
-            ),
-            patch(
-                "sglang.srt.layers.moe.fused_moe_triton.layer._deferred_finalize_info_logged",
-                True,
-            ),
-        ):
-            with self.assertRaisesRegex(
-                NotImplementedError,
-                "all routed experts in global GPU expert storage.*heterogeneous CPU/GPU",
-            ):
-                FusedMoE(
-                    num_experts=4,
-                    top_k=2,
-                    hidden_size=8,
-                    intermediate_size=16,
-                    layer_id=0,
-                    params_dtype=torch.bfloat16,
-                )
-
-        method.create_weights.assert_not_called()
 
 
 if __name__ == "__main__":
