@@ -8971,6 +8971,12 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
+        if self.enable_two_batch_overlap and self.moe_a2a_backend == "moonep":
+            raise ValueError(
+                "The current SGLang MoonEP BF16 reference PoC does not support "
+                "two-batch overlap; overlap and multi-inflight buffer/plan "
+                "ownership have not been validated."
+            )
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
