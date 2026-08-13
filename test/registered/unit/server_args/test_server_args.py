@@ -1503,6 +1503,14 @@ class TestWaterfillArgs(CustomTestCase):
 
 
 class TestMoonEPArgs(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self._cuda_patcher = patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        )
+        self._cuda_patcher.start()
+        self.addCleanup(self._cuda_patcher.stop)
+
     def test_moonep_backend_is_recognized_and_disables_cuda_graph(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1547,6 +1555,46 @@ class TestMoonEPArgs(CustomTestCase):
 
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
         self.assertFalse(server_args.enable_eplb)
+
+    def test_moonep_rejects_obvious_non_cuda_platform(self):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="moonep")
+        with patch("sglang.srt.server_args.is_cuda", return_value=False):
+            with self.assertRaisesRegex(ValueError, "requires a CUDA platform"):
+                server_args._handle_a2a_moe()
+
+    def test_moonep_allows_only_kimi_k3_model_architecture(self):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="moonep")
+        server_args.model_path = "test-model"
+        server_args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+        )
+        with self.assertRaisesRegex(ValueError, "validated only for Kimi-K3"):
+            server_args._handle_a2a_moe()
+
+    def test_moonep_accepts_kimi_k3_model_architecture(self):
+        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="moonep")
+        server_args.model_path = "test-model"
+        server_args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK3ForConditionalGeneration"]
+            )
+        )
+        server_args._handle_a2a_moe()
+
+    def test_moonep_rejects_nontrivial_expert_ownership_configuration(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="moonep",
+            ep_num_redundant_experts=1,
+        )
+        server_args.model_path = "test-model"
+        server_args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK3ForConditionalGeneration"]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "global expert-row layout"):
+            server_args._handle_a2a_moe()
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

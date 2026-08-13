@@ -6791,6 +6791,16 @@ class ServerArgs:
             run_post_process_pass,
         )
 
+        requested_moonep = self.moe_a2a_backend == "moonep" or (
+            self.speculative_moe_a2a_backend == "moonep"
+        )
+        if requested_moonep and self.enable_waterfill:
+            raise ValueError(
+                "The current SGLang MoonEP BF16 reference path does not support "
+                "Waterfill because it changes the routed expert-id/ownership "
+                "contract."
+            )
+
         run_post_process_pass(self, _a2a_backend_overrides)
         run_post_process_pass(self, _a2a_ep_size)
 
@@ -6800,6 +6810,10 @@ class ServerArgs:
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
+        if a2a_backend == "moonep" or (
+            resolved_view(self).speculative_moe_a2a_backend == "moonep"
+        ):
+            self._validate_moonep_reference_configuration()
         if self.enable_waterfill:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
@@ -6933,8 +6947,77 @@ class ServerArgs:
             required = max(required, self.cuda_graph_max_bs_decode)
         return required
 
+    def _validate_moonep_reference_configuration(self) -> None:
+        """Validate the narrow server-side contract of the MoonEP reference path."""
+
+        if not is_cuda():
+            raise ValueError(
+                "The current SGLang MoonEP BF16 reference path requires a CUDA "
+                "platform; CPU, ROCm, NPU, XPU, and MUSA configurations are "
+                "unsupported."
+            )
+
+        # ``dummy`` and ``none`` intentionally have no model architecture to
+        # validate. The standalone validation script also does not construct
+        # ServerArgs, so this guard does not narrow that adapter-level tool.
+        if self.model_path.lower() in ("dummy", "none"):
+            return
+        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+            raise ValueError(
+                "The current SGLang MoonEP reference integration requires a "
+                "resolved model architecture and cannot validate an instance "
+                "connector at startup."
+            )
+
+        architectures = getattr(
+            getattr(self.get_model_config(), "hf_config", None),
+            "architectures",
+            None,
+        ) or ()
+        if "KimiK3ForConditionalGeneration" not in architectures:
+            raise ValueError(
+                "The current SGLang MoonEP reference integration is validated "
+                "only for Kimi-K3 model-level MoE semantics "
+                "(KimiK3ForConditionalGeneration); generic model support "
+                "requires an explicit EP-A2A capability integration."
+            )
+
+        unsupported = []
+        if self.ep_num_redundant_experts != 0:
+            unsupported.append("--ep-num-redundant-experts")
+        if self.init_expert_location != "trivial":
+            unsupported.append("--init-expert-location")
+        if self.ep_dispatch_algorithm is not None:
+            unsupported.append("--ep-dispatch-algorithm")
+        if self.enable_waterfill:
+            unsupported.append("--enable-waterfill")
+        if self.elastic_ep_backend is not None:
+            unsupported.append("--elastic-ep-backend")
+        if self.ep_join_mode is not None:
+            unsupported.append("--elastic-ep-join-mode")
+        if self.elastic_ep_rejoin:
+            unsupported.append("--elastic-ep-rejoin")
+        if self.max_ep_size is not None:
+            unsupported.append("--max-ep-size")
+        if self.elastic_ep_initial_size is not None:
+            unsupported.append("--elastic-ep-initial-size")
+        if self.ep_join_rank_offset != 0:
+            unsupported.append("--elastic-ep-join-rank-offset")
+        if self.enable_elastic_expert_backup:
+            unsupported.append("--enable-elastic-expert-backup")
+        if unsupported:
+            raise ValueError(
+                "The current SGLang MoonEP BF16 reference path requires a "
+                "simple global expert-row layout and does not support: "
+                + ", ".join(unsupported)
+                + "."
+            )
+
     def _handle_eplb_and_dispatch(self):
-        if self.enable_eplb and self._resolved().moe_a2a_backend == "moonep":
+        if self.enable_eplb and (
+            self._resolved().moe_a2a_backend == "moonep"
+            or self._resolved().speculative_moe_a2a_backend == "moonep"
+        ):
             raise ValueError(
                 "The current SGLang MoonEP BF16 reference path does not support "
                 "EPLB because its replicated global expert layout has no "
@@ -8971,7 +9054,10 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "moonep":
+        if self.enable_two_batch_overlap and (
+            self.moe_a2a_backend == "moonep"
+            or self.speculative_moe_a2a_backend == "moonep"
+        ):
             raise ValueError(
                 "The current SGLang MoonEP BF16 reference PoC does not support "
                 "two-batch overlap; overlap and multi-inflight buffer/plan "
