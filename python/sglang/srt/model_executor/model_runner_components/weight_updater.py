@@ -35,11 +35,22 @@ logger = logging.getLogger(__name__)
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
-    writes are invisible to it, so an update would silently keep serving the
-    old weights. The check is startup-determined and rank-uniform, so an
-    update never proceeds on some workers while rejected on others.
+    The current SGLang MoonEP BF16 reference path caches copied expert layouts;
+    in-place loader writes are invisible to those copies, so an update would
+    silently keep serving old experts. The HPC-Ops bf16xfp32 GEMM has the same
+    class of derived-cache hazard. These checks are startup-determined and
+    rank-uniform, so an update never proceeds on some workers while rejected on
+    others.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if get_moe_a2a_backend().is_moonep():
+        return (
+            "Online weight updates are not supported by the current SGLang "
+            "MoonEP BF16 reference path because it caches copied expert layouts; "
+            "restart/rebuild the model after updating weights."
+        )
+
     from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():

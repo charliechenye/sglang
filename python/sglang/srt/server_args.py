@@ -6832,9 +6832,9 @@ class ServerArgs:
 
         if a2a_backend == "moonep":
             logger.warning(
-                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
-                "Cuda graph is disabled while the eager MoonEP dispatch/"
-                "prefetch/compute/combine path is validated."
+                "MoonEP MoE is enabled for the current SGLang MoonEP BF16 "
+                "reference path. Cuda graph is disabled while the eager MoonEP "
+                "dispatch/prefetch/compute/combine path is validated."
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
@@ -6934,6 +6934,13 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_eplb and self._resolved().moe_a2a_backend == "moonep":
+            raise ValueError(
+                "The current SGLang MoonEP BF16 reference path does not support "
+                "EPLB because its replicated global expert layout has no "
+                "expert-rebalancing ownership or cache-invalidation contract."
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
