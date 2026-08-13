@@ -1518,6 +1518,34 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
+    def test_moonep_rejects_eplb_during_dispatch_configuration(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="moonep",
+            enable_eplb=True,
+        )
+        server_args._handle_a2a_moe()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "replicated global expert layout.*expert-rebalancing ownership",
+        ):
+            server_args._handle_eplb_and_dispatch()
+
+    def test_moonep_without_eplb_resolves_normally(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="moonep",
+            enable_eplb=False,
+        )
+        server_args._handle_a2a_moe()
+        server_args._handle_eplb_and_dispatch()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
+        self.assertFalse(server_args.enable_eplb)
+
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
