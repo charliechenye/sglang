@@ -562,6 +562,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         return
 
+    def has_transformed_expert_weight_layout(
+        self, layer: torch.nn.Module | None = None
+    ) -> bool:
+        """Report post-load transforms that change expert tensor semantics."""
+
+        if self.use_triton_kernels or self.use_flashinfer_trtllm_moe:
+            return True
+        if _is_cpu and _is_cpu_amx_available:
+            return True
+        if layer is None:
+            return False
+        return (
+            _use_aiter
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            and self._aiter_ck_moe_supported(layer)
+            and not getattr(layer, "_skip_aiter_moe_shuffle", False)
+        )
+
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
         layer: torch.nn.Module,

@@ -39,6 +39,9 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.moonep import (
+    validate_moonep_reference_bf16_config,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -399,14 +402,15 @@ class FusedMoE(torch.nn.Module):
 
         moonep_global_weight_storage = get_moe_a2a_backend().is_moonep()
         if moonep_global_weight_storage:
-            if quant_config is not None:
-                raise NotImplementedError(
-                    "MoonEP PoC supports unquantized BF16 MoE weights only."
-                )
-            if num_fused_shared_experts != 0:
-                raise NotImplementedError(
-                    "MoonEP PoC does not support fused shared experts yet."
-                )
+            validate_moonep_reference_bf16_config(
+                quant_config=quant_config,
+                params_dtype=params_dtype,
+                num_fused_shared_experts=num_fused_shared_experts,
+                with_bias=with_bias,
+                activation=activation,
+                quant_method=self.quant_method,
+                layer=self,
+            )
 
         self.quant_method.create_weights(
             layer=self,
