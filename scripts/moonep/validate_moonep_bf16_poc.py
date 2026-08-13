@@ -6,18 +6,21 @@ Run with torchrun on a single NVLink/NVSwitch node, for example:
   PYTHONPATH=python \
   SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128 \
   torchrun --standalone --nproc-per-node=4 \
-    scripts/moonep/validate_moonep_bf16_poc.py --tokens 128 --hidden-size 1024
+    scripts/moonep/validate_moonep_bf16_poc.py --tokens 128 --hidden-size 1024 \
+      --activation situ --situ-beta 4 --situ-linear-beta 25
 
 The script validates the current SGLang MoonEP BF16 reference path:
 MoonEPDispatcher.dispatch -> MoonEPBuffer.prefetch_weight -> BF16 segment runner
--> MoonEPDispatcher.combine.  The expert step is an explicit SiLU reference
-runner over synthetic unquantized BF16 weights; this is not production Kimi-K3
-SiTU or quantized expert validation.
+-> MoonEPDispatcher.combine.  The expert step is an explicit SiLU or SiTU
+reference runner over synthetic unquantized BF16 weights; this is not production
+Kimi-K3 or quantized expert validation.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import importlib.util
 import json
 import os
 
@@ -25,6 +28,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
     MoonEPDispatcher,
@@ -45,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument("--atol", type=float, default=5e-2)
     parser.add_argument("--rtol", type=float, default=5e-2)
+    parser.add_argument("--activation", choices=("silu", "situ"), default="silu")
+    parser.add_argument("--situ-beta", type=float, default=None)
+    parser.add_argument("--situ-linear-beta", type=float, default=None)
     return parser.parse_args()
 
 
@@ -72,14 +79,32 @@ def make_topk(tokens: int, top_k: int, num_experts: int, device: torch.device):
     return topk_ids, topk_weights
 
 
-def expert_mlp(x, expert_id: int, gate, up, down):
+def _make_activation(args: argparse.Namespace):
+    if args.activation == "silu":
+        if args.situ_beta is not None or args.situ_linear_beta is not None:
+            raise ValueError(
+                "--situ-beta and --situ-linear-beta require --activation situ."
+            )
+        return SiluAndMul()
+    if args.situ_beta is None:
+        return SituAndMul(linear_beta=args.situ_linear_beta)
+    return SituAndMul(
+        beta=args.situ_beta,
+        linear_beta=args.situ_linear_beta,
+    )
+
+
+def expert_mlp(x, expert_id: int, gate, up, down, activation_op):
+    gate_up = torch.cat(
+        (F.linear(x, gate[expert_id]), F.linear(x, up[expert_id])), dim=-1
+    )
     return F.linear(
-        F.silu(F.linear(x, gate[expert_id])) * F.linear(x, up[expert_id]),
+        activation_op.forward_native(gate_up),
         down[expert_id],
     )
 
 
-def reference_output(hidden, topk_ids, topk_weights, gate, up, down):
+def reference_output(hidden, topk_ids, topk_weights, gate, up, down, activation_op):
     out = torch.zeros_like(hidden)
     tokens, top_k = topk_ids.shape
     for token_idx in range(tokens):
@@ -87,15 +112,16 @@ def reference_output(hidden, topk_ids, topk_weights, gate, up, down):
         acc = torch.zeros_like(x)
         for k in range(top_k):
             expert_id = int(topk_ids[token_idx, k].item())
-            acc += expert_mlp(x, expert_id, gate, up, down) * topk_weights[
-                token_idx, k
-            ].to(hidden.dtype)
+            acc += expert_mlp(
+                x, expert_id, gate, up, down, activation_op
+            ) * topk_weights[token_idx, k].to(hidden.dtype)
         out[token_idx] = acc[0]
     return out
 
 
 def main() -> None:
     args = parse_args()
+    activation_op = _make_activation(args)
     os.environ["SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(args.tokens)
     if args.prefetch_slots > 0:
         os.environ["SGLANG_MOONEP_NUM_PREFETCH_SLOTS"] = str(args.prefetch_slots)
@@ -167,10 +193,24 @@ def main() -> None:
         )
 
         dispatcher.prefetch_weight(dispatch_output.plan, layout)
-        combine_input = run_moonep_bf16_expert(dispatch_output, layout)
+        combine_input = run_moonep_bf16_expert(
+            dispatch_output,
+            layout,
+            activation=args.activation,
+            gemm1_alpha=args.situ_beta,
+            gemm1_clamp_limit=args.situ_linear_beta,
+        )
         output = dispatcher.combine(combine_input)
 
-        expected = reference_output(hidden, topk_ids, topk_weights, gate, up, down)
+        expected = reference_output(
+            hidden,
+            topk_ids,
+            topk_weights,
+            gate,
+            up,
+            down,
+            activation_op,
+        )
         max_abs_err = (output.float() - expected.float()).abs().max()
         rel_err = max_abs_err / expected.float().abs().max().clamp_min(1e-6)
         local_ok = bool(
@@ -183,9 +223,26 @@ def main() -> None:
         )
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
 
+        moonep_spec = importlib.util.find_spec("moonep")
+        moonep_module_path = moonep_spec.origin if moonep_spec is not None else None
+        moonep_package_version = None
+        for distribution_name in ("moonep", "moon-ep", "MoonEP"):
+            try:
+                moonep_package_version = importlib.metadata.version(distribution_name)
+                break
+            except importlib.metadata.PackageNotFoundError:
+                continue
+
         result = {
-            "expert_compute": "reference_silu",
-            "validation_scope": "moonep_dispatch_prefetch_reference_combine",
+            "expert_compute": f"reference_{args.activation}",
+            "activation": args.activation,
+            "activation_parameters": {
+                "gemm1_alpha": args.situ_beta,
+                "gemm1_clamp_limit": args.situ_linear_beta,
+            },
+            "validation_scope": "moonep_dispatch_prefetch_reference_compute_combine",
+            "moonep_module_path": moonep_module_path,
+            "moonep_package_version": moonep_package_version,
             "rank": rank,
             "world_size": world_size,
             "tokens": args.tokens,

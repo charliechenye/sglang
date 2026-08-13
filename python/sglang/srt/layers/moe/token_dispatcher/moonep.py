@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, NamedTuple, NoReturn, Optional
 
@@ -8,6 +9,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -34,6 +36,48 @@ _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE = (
     "global GPU expert storage and does not support heterogeneous CPU/GPU expert "
     "ownership."
 )
+_MOONEP_REFERENCE_ACTIVATIONS = frozenset(("silu", "situ"))
+
+
+def _validate_moonep_reference_activation(
+    *,
+    activation: str,
+    gemm1_alpha: float | None,
+    gemm1_clamp_limit: float | None,
+) -> None:
+    """Validate the activation contract shared by config and expert compute."""
+
+    if activation not in _MOONEP_REFERENCE_ACTIVATIONS:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            f"activations {sorted(_MOONEP_REFERENCE_ACTIVATIONS)}, "
+            f"got {activation!r}."
+        )
+
+    for name, value in (
+        ("gemm1_alpha", gemm1_alpha),
+        ("gemm1_clamp_limit", gemm1_clamp_limit),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(
+                f"The current SGLang MoonEP BF16 reference path requires "
+                f"{name} to be a finite positive number or None, got {value!r}."
+            )
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(
+                f"The current SGLang MoonEP BF16 reference path requires "
+                f"{name} to be finite and positive, got {value!r}."
+            )
+
+    if activation == "silu" and (
+        gemm1_alpha is not None or gemm1_clamp_limit is not None
+    ):
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path accepts "
+            "gemm1_alpha and gemm1_clamp_limit only for activation='situ'."
+        )
 
 
 def _unwrap_moe_weight_method(quant_method: Any) -> Any:
@@ -93,6 +137,8 @@ def validate_moonep_reference_bf16_config(
     num_fused_shared_experts: int,
     with_bias: bool,
     activation: str,
+    gemm1_alpha: float | None = None,
+    gemm1_clamp_limit: float | None = None,
     quant_method: Any | None = None,
     layer: torch.nn.Module | None = None,
 ) -> None:
@@ -120,12 +166,11 @@ def validate_moonep_reference_bf16_config(
             "The current SGLang MoonEP BF16 reference path does not support "
             "expert bias; use with_bias=False."
         )
-    if activation != "silu":
-        raise NotImplementedError(
-            "The current SGLang MoonEP BF16 reference expert runner supports "
-            "SiLU only; production "
-            "Kimi-K3 SiTU compute is not wired through this PoC."
-        )
+    _validate_moonep_reference_activation(
+        activation=activation,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+    )
     if quant_method is not None:
         validate_moonep_reference_bf16_weight_layout(
             quant_method=quant_method,
@@ -473,6 +518,8 @@ def get_moonep_expert_weight_layout(
         ),
         with_bias=getattr(layer, "with_bias", False),
         activation=getattr(moe_runner_config, "activation", "silu"),
+        gemm1_alpha=getattr(moe_runner_config, "gemm1_alpha", None),
+        gemm1_clamp_limit=getattr(moe_runner_config, "gemm1_clamp_limit", None),
         quant_method=getattr(layer, "quant_method", None),
         layer=layer,
     )
@@ -558,6 +605,8 @@ def run_moonep_bf16_expert(
     weight_layout: MoonEPExpertWeightLayout,
     *,
     activation: str = "silu",
+    gemm1_alpha: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> MoonEPCombineInput:
     """Run a simple BF16 MoonEP expert core over ``cu_seqlens`` segments.
 
@@ -568,12 +617,11 @@ def run_moonep_bf16_expert(
     `MoonEPDispatcher.combine`.
     """
 
-    if activation != "silu":
-        raise NotImplementedError(
-            "The current SGLang MoonEP BF16 reference expert runner supports "
-            "SiLU only; production "
-            f"Kimi-K3 SiTU compute is not wired through this PoC (got {activation!r})."
-        )
+    _validate_moonep_reference_activation(
+        activation=activation,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+    )
 
     hidden_states = dispatch_output.hidden_states
     route_weights_nvs = dispatch_output.route_weights_nvs
@@ -685,6 +733,19 @@ def run_moonep_bf16_expert(
         )
 
     output = torch.empty_like(hidden_states)
+    if activation == "silu":
+        activation_op = SiluAndMul()
+    else:
+        # The computation and its default beta are delegated to SGLang's
+        # canonical native SiTU implementation.  K3 checkpoints that need
+        # non-default parameters pass them through MoeRunnerConfig.
+        if gemm1_alpha is None:
+            activation_op = SituAndMul(linear_beta=gemm1_clamp_limit)
+        else:
+            activation_op = SituAndMul(
+                beta=gemm1_alpha,
+                linear_beta=gemm1_clamp_limit,
+            )
     prev = 0
     for group_id in range(cu_seqlens.numel()):
         cur = int(cu_seqlens[group_id].item())
@@ -721,7 +782,7 @@ def run_moonep_bf16_expert(
         x = hidden_states[prev:cur]
         gate = F.linear(x, weight_layout.full_gate_weight[expert_id])
         up = F.linear(x, weight_layout.full_up_weight[expert_id])
-        activated = F.silu(gate) * up
+        activated = activation_op.forward_native(torch.cat((gate, up), dim=-1))
         y = F.linear(activated, weight_layout.full_down_weight[expert_id])
         if route_weights_nvs is not None:
             y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)

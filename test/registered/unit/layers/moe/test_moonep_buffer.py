@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.activation import SituAndMul
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
@@ -357,7 +358,7 @@ class TestMoonEPExpertWeightLayout(unittest.TestCase):
         cases = [
             ("with_bias", True, "expert bias"),
             ("params_dtype", torch.float16, "params_dtype"),
-            ("activation", "situ", "SiLU only"),
+            ("activation", "gelu", "activations"),
         ]
         for attribute, value, message in cases:
             with self.subTest(attribute=attribute):
@@ -521,6 +522,71 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
         self.assertIs(combine_input.plan, dispatch_output.plan)
         self.assertEqual(combine_input.num_tokens, 2)
 
+    def test_segment_runner_situ_matches_native_sglang_reference(self):
+        hidden_states = torch.tensor(
+            [[1.5, -2.0], [8.0, -7.0], [24.0, -19.0]],
+            dtype=torch.bfloat16,
+        )
+        route_weights = torch.tensor([1.0, 0.5, 2.0], dtype=torch.float32)
+        gate = torch.tensor(
+            [
+                [[4.0, -3.0], [2.0, 1.0]],
+                [[-1.5, 2.5], [3.0, -4.0]],
+            ],
+            dtype=torch.bfloat16,
+        )
+        up = torch.tensor(
+            [
+                [[5.0, 6.0], [-7.0, 8.0]],
+                [[10.0, -9.0], [12.0, -11.0]],
+            ],
+            dtype=torch.bfloat16,
+        )
+        down = torch.tensor(
+            [
+                [[1.0, 0.5], [-0.25, 2.0]],
+                [[-1.0, 0.75], [0.5, 1.5]],
+            ],
+            dtype=torch.bfloat16,
+        )
+        layout = MoonEPExpertWeightLayout(gate, up, down, num_prefetch_slots=0)
+        dispatch_output = MoonEPDispatchOutput(
+            hidden_states=hidden_states,
+            route_weights_nvs=route_weights,
+            cu_seqlens=torch.tensor([2, 3], dtype=torch.int32),
+            plan=object(),
+            expert_ids=torch.tensor([0, 1], dtype=torch.int32),
+            num_tokens=3,
+        )
+
+        beta = 4.0
+        linear_beta = 25.0
+        combine_input = run_moonep_bf16_expert(
+            dispatch_output,
+            layout,
+            activation="situ",
+            gemm1_alpha=beta,
+            gemm1_clamp_limit=linear_beta,
+        )
+
+        native_situ = SituAndMul(beta=beta, linear_beta=linear_beta)
+        expected = torch.empty_like(hidden_states)
+        for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
+            x = hidden_states[start:end]
+            gate_up = torch.cat(
+                (
+                    torch.nn.functional.linear(x, gate[expert]),
+                    torch.nn.functional.linear(x, up[expert]),
+                ),
+                dim=-1,
+            )
+            y = torch.nn.functional.linear(
+                native_situ.forward_native(gate_up), down[expert]
+            )
+            expected[start:end] = y * route_weights[start:end, None]
+
+        torch.testing.assert_close(combine_input.hidden_states, expected)
+
     def test_runner_rejects_non_bf16_hidden_states(self):
         dispatch_output = MoonEPDispatchOutput(
             hidden_states=torch.zeros(1, 2, dtype=torch.float32),
@@ -663,7 +729,7 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     run_moonep_bf16_expert(dispatch_output, layout)
 
-    def test_runner_rejects_non_silu_activation(self):
+    def test_runner_rejects_unsupported_activation(self):
         dispatch_output = MoonEPDispatchOutput(
             hidden_states=torch.zeros(0, 2, dtype=torch.bfloat16),
             route_weights_nvs=None,
@@ -679,11 +745,11 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
             num_prefetch_slots=0,
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "SiLU only"):
+        with self.assertRaisesRegex(NotImplementedError, "activations"):
             run_moonep_bf16_expert(
                 dispatch_output,
                 layout,
-                activation="situ",
+                activation="gelu",
             )
 
 
@@ -731,13 +797,41 @@ class TestMoonEPDispatcherRankContract(unittest.TestCase):
 
 
 class TestMoonEPConfigContract(unittest.TestCase):
+    def test_accepts_situ_with_k3_parameters(self):
+        validate_moonep_reference_bf16_config(
+            quant_config=None,
+            params_dtype=torch.bfloat16,
+            num_fused_shared_experts=0,
+            with_bias=False,
+            activation="situ",
+            gemm1_alpha=4.0,
+            gemm1_clamp_limit=25.0,
+        )
+
+    def test_rejects_invalid_situ_parameters(self):
+        for name, value, error_type in (
+            ("gemm1_alpha", 0.0, ValueError),
+            ("gemm1_clamp_limit", float("nan"), ValueError),
+            ("gemm1_alpha", "4", TypeError),
+        ):
+            with self.subTest(name=name, value=value):
+                with self.assertRaises(error_type):
+                    validate_moonep_reference_bf16_config(
+                        quant_config=None,
+                        params_dtype=torch.bfloat16,
+                        num_fused_shared_experts=0,
+                        with_bias=False,
+                        activation="situ",
+                        **{name: value},
+                    )
+
     def test_rejects_unsupported_layer_configurations(self):
         cases = [
             ({"quant_config": object()}, "quant_config must be None"),
             ({"params_dtype": torch.float16}, "params_dtype"),
             ({"num_fused_shared_experts": 1}, "fused shared experts"),
             ({"with_bias": True}, "expert bias"),
-            ({"activation": "situ"}, "SiLU only"),
+            ({"activation": "gelu"}, "activations"),
         ]
         for overrides, message in cases:
             kwargs = dict(
