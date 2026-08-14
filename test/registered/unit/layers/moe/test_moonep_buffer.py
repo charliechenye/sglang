@@ -332,58 +332,69 @@ class TestMoonEPRealWeightLoaderLayout(unittest.TestCase):
 
 
 class TestMoonEPBf16ExpertRunner(unittest.TestCase):
-    def test_segment_runner_applies_expert_weights_and_route_weights(self):
+    def test_segment_runner_uses_physical_vm_group_weight_rows(self):
         hidden_states = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
-            dtype=torch.float32,
+            [[1.0, 2.0], [5.0, 6.0]],
+            dtype=torch.bfloat16,
         )
-        route_weights = torch.tensor([1.0, 0.5, 2.0], dtype=torch.float32)
-        cu_seqlens = torch.tensor([2, 3], dtype=torch.int32)
-        expert_ids = torch.tensor([0, 1], dtype=torch.int32)
+        route_weights = torch.tensor([1.0, 1.5], dtype=torch.float32)
+        # E=2 source rows plus B=1 physical prefetch slot.  This is the
+        # planner-realistic shape for one ordinary source group, one empty
+        # source group, and one non-empty prefetch slot group.  Group 2 must
+        # use weight row 2 directly; no plan mapping is involved in the
+        # runner.
+        cu_seqlens = torch.tensor([1, 1, 2], dtype=torch.int32)
         gate = torch.tensor(
             [
                 [[1.0, 0.0], [0.0, 1.0]],
+                # Empty source row 1 is deliberately different from the
+                # controlled prefetch-slot payload in physical row 2.
                 [[0.5, 0.0], [0.0, 0.5]],
-            ]
+                [[3.0, 0.0], [0.0, 3.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         up = torch.tensor(
             [
                 [[2.0, 0.0], [0.0, 2.0]],
                 [[1.5, 0.0], [0.0, 1.5]],
-            ]
+                [[4.0, 0.0], [0.0, 4.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         down = torch.tensor(
             [
                 [[1.0, 0.0], [0.0, 1.0]],
                 [[2.0, 0.0], [0.0, 2.0]],
-            ]
+                [[5.0, 0.0], [0.0, 5.0]],
+            ],
+            dtype=torch.bfloat16,
         )
         layout = MoonEPExpertWeightLayout(
             full_gate_weight=gate,
             full_up_weight=up,
             full_down_weight=down,
-            num_prefetch_slots=0,
+            num_prefetch_slots=1,
         )
         dispatch_output = MoonEPDispatchOutput(
             hidden_states=hidden_states,
             route_weights_nvs=route_weights,
             cu_seqlens=cu_seqlens,
             plan=object(),
-            expert_ids=expert_ids,
             num_tokens=2,
         )
 
         combine_input = run_moonep_bf16_expert(dispatch_output, layout)
 
         expected = torch.empty_like(hidden_states)
-        for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
+        for start, end, physical_row in [(0, 1, 0), (1, 2, 2)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
                 torch.nn.functional.silu(
-                    torch.nn.functional.linear(x, gate[expert])
+                    torch.nn.functional.linear(x, gate[physical_row])
                 )
-                * torch.nn.functional.linear(x, up[expert]),
-                down[expert],
+                * torch.nn.functional.linear(x, up[physical_row]),
+                down[physical_row],
             )
             expected[start:end] = y * route_weights[start:end, None]
 

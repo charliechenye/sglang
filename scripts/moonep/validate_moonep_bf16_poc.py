@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-"""Distributed BF16 MoonEP PoC validation.
+"""Distributed validation for the current SGLang MoonEP BF16 reference path.
 
 Run with torchrun on a single NVLink/NVSwitch node, for example:
 
+  PYTHONPATH=python \
   SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128 \
   torchrun --standalone --nproc-per-node=4 \
     scripts/moonep/validate_moonep_bf16_poc.py --tokens 128 --hidden-size 1024
 
-The script validates SGLang's MoonEP BF16 path:
+The script validates the current SGLang MoonEP BF16 reference path:
 MoonEPDispatcher.dispatch -> MoonEPBuffer.prefetch_weight -> BF16 segment runner
--> MoonEPDispatcher.combine.  It compares the final token-major output against a
-rank-local PyTorch reference using the same top-k and expert weights.
+-> MoonEPDispatcher.combine.  The expert step is an explicit SiLU reference
+runner over synthetic unquantized BF16 weights; this is not production Kimi-K3
+SiTU or quantized expert validation.
 """
 
 from __future__ import annotations
 
 import argparse
-from enum import IntEnum, auto
 import json
 import os
-import sys
-from pathlib import Path
-from types import ModuleType
-from typing import NamedTuple, Protocol, TypeGuard, runtime_checkable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from sglang.srt.layers.moe.token_dispatcher.moonep import (
+    MoonEPBuffer,
+    MoonEPDispatcher,
+    MoonEPExpertWeightLayout,
+    run_moonep_bf16_expert,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,126 +72,6 @@ def make_topk(tokens: int, top_k: int, num_experts: int, device: torch.device):
     return topk_ids, topk_weights
 
 
-class LightweightTopKOutputFormat(IntEnum):
-    STANDARD = auto()
-
-
-@runtime_checkable
-class LightweightTopKOutput(Protocol):
-    @property
-    def format(self) -> LightweightTopKOutputFormat: ...
-
-
-class LightweightStandardTopKOutput(NamedTuple):
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
-
-    @property
-    def format(self) -> LightweightTopKOutputFormat:
-        return LightweightTopKOutputFormat.STANDARD
-
-
-class LightweightTopKOutputChecker:
-    @staticmethod
-    def format_is_standard(
-        topk_output: LightweightTopKOutput,
-    ) -> TypeGuard[LightweightStandardTopKOutput]:
-        return isinstance(topk_output, LightweightStandardTopKOutput)
-
-
-class LightweightDeepEPMode(IntEnum):
-    NORMAL = 1
-    LOW_LATENCY = 2
-    AUTO = 3
-
-
-def install_lightweight_sglang_imports() -> None:
-    """Install validation-only SGLang package stubs.
-
-    Full SGLang environments should use the normal imports.  Minimal remote
-    validation images often do not carry every frontend/model dependency that
-    SGLang's package ``__init__`` imports, though this script only needs the
-    MoonEP dispatcher, its base protocol, envs, and runtime buffer registry.
-    These stubs keep the package search path pointed at the checked-out source
-    tree while bypassing heavyweight parent ``__init__`` files.
-    """
-
-    repo_root = Path(__file__).resolve().parents[2]
-    sglang_root = repo_root / "python" / "sglang"
-
-    for name in list(sys.modules):
-        if name == "sglang" or name.startswith("sglang."):
-            del sys.modules[name]
-
-    def add_package(name: str, path: Path) -> None:
-        module = ModuleType(name)
-        module.__path__ = [str(path)]
-        sys.modules[name] = module
-
-    add_package("sglang", sglang_root)
-    add_package("sglang.srt", sglang_root / "srt")
-    add_package("sglang.srt.layers", sglang_root / "srt" / "layers")
-    add_package("sglang.srt.layers.moe", sglang_root / "srt" / "layers" / "moe")
-    add_package(
-        "sglang.srt.layers.moe.token_dispatcher",
-        sglang_root / "srt" / "layers" / "moe" / "token_dispatcher",
-    )
-
-    topk_module = ModuleType("sglang.srt.layers.moe.topk")
-    topk_module.TopKOutputFormat = LightweightTopKOutputFormat
-    topk_module.TopKOutput = LightweightTopKOutput
-    topk_module.StandardTopKOutput = LightweightStandardTopKOutput
-    topk_module.TopKOutputChecker = LightweightTopKOutputChecker
-    sys.modules[topk_module.__name__] = topk_module
-
-    utils_module = ModuleType("sglang.srt.layers.moe.utils")
-    utils_module.DeepEPMode = LightweightDeepEPMode
-    sys.modules[utils_module.__name__] = utils_module
-
-
-def import_moonep_validation_symbols():
-    try:
-        from sglang.srt.layers.moe.token_dispatcher.moonep import (
-            MoonEPBuffer,
-            MoonEPDispatcher,
-            MoonEPExpertWeightLayout,
-            run_moonep_bf16_expert,
-        )
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        return (
-            MoonEPBuffer,
-            MoonEPDispatcher,
-            MoonEPExpertWeightLayout,
-            run_moonep_bf16_expert,
-            StandardTopKOutput,
-        )
-    except ModuleNotFoundError as exc:
-        print(
-            "Normal SGLang import failed; retrying with lightweight validation "
-            f"imports: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        install_lightweight_sglang_imports()
-        from sglang.srt.layers.moe.token_dispatcher.moonep import (
-            MoonEPBuffer,
-            MoonEPDispatcher,
-            MoonEPExpertWeightLayout,
-            run_moonep_bf16_expert,
-        )
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        return (
-            MoonEPBuffer,
-            MoonEPDispatcher,
-            MoonEPExpertWeightLayout,
-            run_moonep_bf16_expert,
-            StandardTopKOutput,
-        )
-
-
 def expert_mlp(x, expert_id: int, gate, up, down):
     return F.linear(
         F.silu(F.linear(x, gate[expert_id])) * F.linear(x, up[expert_id]),
@@ -216,105 +101,203 @@ def main() -> None:
         os.environ["SGLANG_MOONEP_NUM_PREFETCH_SLOTS"] = str(args.prefetch_slots)
 
     rank, world_size, local_rank = setup_dist()
-    device = torch.device(f"cuda:{local_rank}")
-    torch.manual_seed(args.seed + rank)
+    try:
+        device = torch.device(f"cuda:{local_rank}")
+        torch.manual_seed(args.seed + rank)
 
-    (
-        MoonEPBuffer,
-        MoonEPDispatcher,
-        MoonEPExpertWeightLayout,
-        run_moonep_bf16_expert,
-        StandardTopKOutput,
-    ) = import_moonep_validation_symbols()
+        num_experts = world_size * args.experts_per_rank
+        hidden = torch.randn(
+            args.tokens,
+            args.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        topk_ids, topk_weights = make_topk(args.tokens, args.top_k, num_experts, device)
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=torch.empty(0, device=device),
+        )
 
-    num_experts = world_size * args.experts_per_rank
-    hidden = torch.randn(
-        args.tokens,
-        args.hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    topk_ids, topk_weights = make_topk(args.tokens, args.top_k, num_experts, device)
-    topk_output = StandardTopKOutput(
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        router_logits=torch.empty(0, device=device),
-    )
+        dispatcher = MoonEPDispatcher(
+            group=dist.group.WORLD,
+            router_topk=args.top_k,
+            num_experts=num_experts,
+            num_local_experts=args.experts_per_rank,
+            hidden_size=args.hidden_size,
+            params_dtype=torch.bfloat16,
+        )
 
-    dispatcher = MoonEPDispatcher(
-        group=dist.group.WORLD,
-        router_topk=args.top_k,
-        num_experts=num_experts,
-        num_local_experts=args.experts_per_rank,
-        hidden_size=args.hidden_size,
-        params_dtype=torch.bfloat16,
-    )
+        dispatch_output = dispatcher.dispatch(hidden, topk_output)
+        num_prefetch_slots = int(dispatch_output.cu_seqlens.numel()) - num_experts
 
-    dispatch_output = dispatcher.dispatch(hidden, topk_output)
-    num_prefetch_slots = int(dispatch_output.expert_ids.numel()) - num_experts
+        # Full global rows are deliberately replicated for this communication
+        # correctness PoC. The production path should replace this with true
+        # symmetric expert-row mappings owned by each expert's home rank.
+        torch.manual_seed(args.seed)
+        gate = (
+            torch.randn(
+                num_experts + num_prefetch_slots,
+                args.intermediate_size,
+                args.hidden_size,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / 8
+        )
+        up = torch.randn_like(gate) / 8
+        down = (
+            torch.randn(
+                num_experts + num_prefetch_slots,
+                args.hidden_size,
+                args.intermediate_size,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / 8
+        )
+        gate[num_experts:].zero_()
+        up[num_experts:].zero_()
+        down[num_experts:].zero_()
+        layout = MoonEPExpertWeightLayout(
+            gate.contiguous(),
+            up.contiguous(),
+            down.contiguous(),
+            num_prefetch_slots,
+        )
 
-    # Full global rows are deliberately replicated for this correctness PoC.
-    # The production path should replace this with true symmetric expert-row
-    # mappings whose physical storage is owned by each expert's home rank.
-    torch.manual_seed(args.seed)
-    gate = torch.randn(
-        num_experts + num_prefetch_slots,
-        args.intermediate_size,
-        args.hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 8
-    up = torch.randn_like(gate) / 8
-    down = torch.randn(
-        num_experts + num_prefetch_slots,
-        args.hidden_size,
-        args.intermediate_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 8
-    gate[num_experts:].zero_()
-    up[num_experts:].zero_()
-    down[num_experts:].zero_()
-    layout = MoonEPExpertWeightLayout(
-        gate.contiguous(),
-        up.contiguous(),
-        down.contiguous(),
-        num_prefetch_slots,
-    )
+        reference_gate = gate[:num_experts].clone()
+        reference_up = up[:num_experts].clone()
+        reference_down = down[:num_experts].clone()
 
-    dispatcher.prefetch_weight(dispatch_output.plan, layout)
-    combine_input = run_moonep_bf16_expert(dispatch_output, layout)
-    output = dispatcher.combine(combine_input)
+        dispatcher.prefetch_weight(dispatch_output.plan, layout)
 
-    expected = reference_output(hidden, topk_ids, topk_weights, gate, up, down)
-    max_abs_err = (output.float() - expected.float()).abs().max()
-    rel_err = max_abs_err / expected.float().abs().max().clamp_min(1e-6)
-    local_ok = bool(
-        torch.allclose(output.float(), expected.float(), atol=args.atol, rtol=args.rtol)
-    )
-    ok_tensor = torch.tensor([1 if local_ok else 0], device=device, dtype=torch.int32)
-    dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+        experts_to_copy = dispatch_output.plan.experts_to_copy[rank]
+        if experts_to_copy.ndim != 1 or experts_to_copy.numel() != num_prefetch_slots:
+            raise ValueError(
+                "MoonEP plan.experts_to_copy[rank] must have shape [B], "
+                f"got {tuple(experts_to_copy.shape)}"
+            )
 
-    result = {
-        "rank": rank,
-        "world_size": world_size,
-        "tokens": args.tokens,
-        "hidden_size": args.hidden_size,
-        "intermediate_size": args.intermediate_size,
-        "top_k": args.top_k,
-        "num_experts": num_experts,
-        "num_prefetch_slots": num_prefetch_slots,
-        "max_abs_err": float(max_abs_err.item()),
-        "relative_err": float(rel_err.item()),
-        "local_ok": local_ok,
-        "global_ok": bool(ok_tensor.item()),
-    }
-    print(json.dumps(result, sort_keys=True), flush=True)
-    dist.barrier(device_ids=[local_rank])
-    MoonEPBuffer.destroy_all_buffers()
-    dist.destroy_process_group()
-    if rank == 0 and not bool(ok_tensor.item()):
-        raise SystemExit(1)
+        active_slots = []
+        slot_rows_ok = True
+        source_rows_empty = True
+        previous_end = 0
+        for group_id, end_tensor in enumerate(dispatch_output.cu_seqlens):
+            end = int(end_tensor.item())
+            if end < previous_end or end > dispatch_output.hidden_states.shape[0]:
+                raise ValueError(
+                    "MoonEP cu_seqlens must be non-decreasing and within "
+                    f"dispatched rows: previous={previous_end}, current={end}, "
+                    f"rows={dispatch_output.hidden_states.shape[0]}"
+                )
+            if group_id >= num_experts and end > previous_end:
+                slot = group_id - num_experts
+                source_expert = int(experts_to_copy[slot].item())
+                if not 0 <= source_expert < num_experts:
+                    slot_rows_ok = False
+                else:
+                    active_slots.append((slot, source_expert))
+                    slot_rows_ok = slot_rows_ok and torch.equal(
+                        layout.full_gate_weight[num_experts + slot],
+                        reference_gate[source_expert],
+                    )
+                    slot_rows_ok = slot_rows_ok and torch.equal(
+                        layout.full_up_weight[num_experts + slot],
+                        reference_up[source_expert],
+                    )
+                    slot_rows_ok = slot_rows_ok and torch.equal(
+                        layout.full_down_weight[num_experts + slot],
+                        reference_down[source_expert],
+                    )
+                    source_start = (
+                        0
+                        if source_expert == 0
+                        else int(dispatch_output.cu_seqlens[source_expert - 1].item())
+                    )
+                    source_rows_empty = source_rows_empty and (
+                        int(dispatch_output.cu_seqlens[source_expert].item())
+                        == source_start
+                    )
+            previous_end = end
+
+        # Poison only the actual source rows after prefetch.  A correct runner
+        # consumes the already-copied physical slot row while the immutable
+        # logical reference continues to use the original source weights.
+        poisoned_sources = set()
+        with torch.no_grad():
+            for _slot, source_expert in active_slots:
+                if source_expert in poisoned_sources:
+                    continue
+                layout.full_gate_weight[source_expert].add_(4.0)
+                layout.full_up_weight[source_expert].add_(4.0)
+                layout.full_down_weight[source_expert].add_(4.0)
+                poisoned_sources.add(source_expert)
+
+        combine_input = run_moonep_bf16_expert(dispatch_output, layout)
+        output = dispatcher.combine(combine_input)
+
+        expected = reference_output(
+            hidden,
+            topk_ids,
+            topk_weights,
+            reference_gate,
+            reference_up,
+            reference_down,
+        )
+        max_abs_err = (output.float() - expected.float()).abs().max()
+        rel_err = max_abs_err / expected.float().abs().max().clamp_min(1e-6)
+        local_ok = bool(
+            source_rows_empty
+            and torch.allclose(
+                output.float(), expected.float(), atol=args.atol, rtol=args.rtol
+            )
+        )
+        ok_tensor = torch.tensor(
+            [1 if local_ok else 0], device=device, dtype=torch.int32
+        )
+        dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+        slot_rows_ok_tensor = torch.tensor(
+            [1 if slot_rows_ok else 0], device=device, dtype=torch.int32
+        )
+        dist.all_reduce(slot_rows_ok_tensor, op=dist.ReduceOp.MIN)
+        active_slot_count_tensor = torch.tensor(
+            [len(active_slots)], device=device, dtype=torch.int32
+        )
+        dist.all_reduce(active_slot_count_tensor, op=dist.ReduceOp.SUM)
+        global_ok = bool(
+            ok_tensor.item()
+            and slot_rows_ok_tensor.item()
+            and active_slot_count_tensor.item() > 0
+        )
+        prefetch_slot_compute_validated = global_ok
+
+        result = {
+            "expert_compute": "reference_silu",
+            "validation_scope": "moonep_dispatch_prefetch_reference_combine",
+            "rank": rank,
+            "world_size": world_size,
+            "tokens": args.tokens,
+            "num_experts": num_experts,
+            "num_prefetch_slots": num_prefetch_slots,
+            "max_abs_err": float(max_abs_err.item()),
+            "relative_err": float(rel_err.item()),
+            "local_ok": local_ok,
+            "prefetch_slot_rows_verified": bool(slot_rows_ok_tensor.item()),
+            "active_prefetch_slot_groups": int(active_slot_count_tensor.item()),
+            "prefetch_slot_compute_validated": prefetch_slot_compute_validated,
+            "global_ok": global_ok,
+        }
+        print(json.dumps(result, sort_keys=True), flush=True)
+        dist.barrier(device_ids=[local_rank])
+        if rank == 0 and not global_ok:
+            raise SystemExit(1)
+    finally:
+        # MoonEP owns VMM/NVLink resources and must be destroyed while its
+        # process group is still alive.
+        MoonEPBuffer.destroy_all_buffers()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
