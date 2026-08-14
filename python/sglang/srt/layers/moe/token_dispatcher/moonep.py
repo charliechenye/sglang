@@ -19,13 +19,97 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
 
-
-_MOONEP_UNSUPPORTED_MESSAGE = (
-    "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
-    "implemented yet. MoonEP is not a drop-in DeepEP-compatible backend: it "
-    "returns a MoonEPCommPlan/cu_seqlens and requires MoonEP-compatible "
-    "contiguous symmetric-memory expert weights plus a VM-group expert GEMM."
+_MOONEP_SPLIT_PHASE_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path supports synchronous/eager "
+    "dispatch, weight prefetch, and combine only; split-phase/overlap methods "
+    "are not implemented. MoonEP uses a distinct dispatch format and is not "
+    "wire-compatible with DeepEP."
 )
+_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path requires canonical [Gate, Up] "
+    "unquantized expert storage; the selected MoE weight method uses a transformed "
+    "expert layout."
+)
+_MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE = (
+    "The current SGLang MoonEP BF16 reference path requires all routed experts in "
+    "global GPU expert storage and does not support heterogeneous CPU/GPU expert "
+    "ownership."
+)
+
+
+def validate_moonep_reference_bf16_weight_layout(
+    *,
+    quant_method: Any,
+    layer: torch.nn.Module | None = None,
+) -> None:
+    """Reject weight methods whose post-load storage is not canonical [Gate, Up]."""
+
+    method = quant_method
+    while True:
+        if getattr(method, "override_num_local_experts", False):
+            raise NotImplementedError(
+                _MOONEP_HETEROGENEOUS_EXPERT_OWNERSHIP_UNSUPPORTED_MESSAGE
+            )
+        gpu_method = getattr(method, "gpu_method", None)
+        if gpu_method is None:
+            break
+        method = gpu_method
+
+    if getattr(method, "load_up_proj_weight_first", False):
+        raise NotImplementedError(_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE)
+
+    has_transformed_layout = getattr(
+        method, "has_transformed_expert_weight_layout", None
+    )
+    if callable(has_transformed_layout) and has_transformed_layout(layer):
+        raise NotImplementedError(_MOONEP_CANONICAL_LAYOUT_UNSUPPORTED_MESSAGE)
+
+
+def validate_moonep_reference_bf16_config(
+    *,
+    quant_config: Any,
+    params_dtype: torch.dtype | None,
+    num_fused_shared_experts: int,
+    with_bias: bool,
+    activation: str,
+    quant_method: Any | None = None,
+    layer: torch.nn.Module | None = None,
+) -> None:
+    """Validate the current SGLang MoonEP BF16 reference-path contract."""
+
+    if quant_config is not None:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path supports unquantized "
+            "expert weights only; "
+            "quant_config must be None."
+        )
+    if params_dtype is not torch.bfloat16:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path requires "
+            "params_dtype=torch.bfloat16, "
+            f"got {params_dtype!r}."
+        )
+    if num_fused_shared_experts != 0:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path does not support "
+            "fused shared experts yet."
+        )
+    if with_bias:
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path does not support "
+            "expert bias; use with_bias=False."
+        )
+    if activation != "silu":
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            "SiLU only; production "
+            "Kimi-K3 SiTU compute is not wired through this PoC."
+        )
+    if quant_method is not None:
+        validate_moonep_reference_bf16_weight_layout(
+            quant_method=quant_method,
+            layer=layer,
+        )
 
 
 class MoonEPDispatchOutput(NamedTuple):
@@ -314,10 +398,10 @@ def get_moonep_expert_weight_layout(
 ) -> MoonEPExpertWeightLayout:
     """Return cached contiguous BF16 gate/up/down tensors for MoonEP.
 
-    The first executable PoC path supports only unquantized BF16 weights stored
-    in global expert-id order.  Rows ``[E, E+B)`` are mutable prefetch slots and
-    are intentionally preserved across calls so ``buffer.prefetch_weight`` can
-    fill them before the MoonEP expert runner consumes the layout.
+    The current SGLang MoonEP BF16 reference path uses unquantized BF16 weights
+    stored in global expert-id order. Rows ``[E, E+B)`` are mutable prefetch
+    slots and are intentionally preserved across calls so ``buffer.prefetch_weight``
+    can fill them before the MoonEP expert runner consumes the layout.
     """
 
     if num_prefetch_slots <= 0:
@@ -325,29 +409,29 @@ def get_moonep_expert_weight_layout(
             f"num_prefetch_slots must be positive, got {num_prefetch_slots}"
         )
 
-    quant_config = getattr(layer, "quant_config", None)
-    if quant_config is not None:
-        raise NotImplementedError(
-            "MoonEP PoC expert weight layout supports unquantized BF16 only."
-        )
-
-    if getattr(layer.moe_runner_config, "num_fused_shared_experts", 0) != 0:
-        raise NotImplementedError(
-            "MoonEP PoC does not support fused shared experts yet."
-        )
-    if not getattr(layer.moe_runner_config, "is_gated", True):
-        raise NotImplementedError("MoonEP PoC requires gated w13 experts.")
-    if getattr(layer, "use_triton_kernels", False):
-        raise NotImplementedError(
-            "MoonEP PoC expects canonical [E, 2I, H] w13 layout, not "
-            "triton-kernels transposed weight layout."
-        )
-
     w13_weight = layer.w13_weight
     w2_weight = layer.w2_weight
+    moe_runner_config = layer.moe_runner_config
+    validate_moonep_reference_bf16_config(
+        quant_config=getattr(layer, "quant_config", None),
+        params_dtype=getattr(layer, "params_dtype", w13_weight.dtype),
+        num_fused_shared_experts=getattr(
+            moe_runner_config, "num_fused_shared_experts", 0
+        ),
+        with_bias=getattr(layer, "with_bias", False),
+        activation=getattr(moe_runner_config, "activation", "silu"),
+        quant_method=getattr(layer, "quant_method", None),
+        layer=layer,
+    )
+    if not getattr(layer.moe_runner_config, "is_gated", True):
+        raise NotImplementedError(
+            "The current SGLang MoonEP BF16 reference path requires gated "
+            "w13 experts."
+        )
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
         raise NotImplementedError(
-            "MoonEP PoC expert runner supports BF16 weights only."
+            "The current SGLang MoonEP BF16 reference expert runner supports "
+            "BF16 weights only."
         )
     if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
         raise ValueError("MoonEP expert source weights must be contiguous.")
@@ -359,12 +443,14 @@ def get_moonep_expert_weight_layout(
     expected_w2_shape = (num_experts, hidden_size, intermediate_size)
     if tuple(w13_weight.shape) != expected_w13_shape:
         raise ValueError(
-            "MoonEP PoC requires global w13_weight shape "
+            "The current SGLang MoonEP BF16 reference path requires global "
+            "w13_weight shape "
             f"{expected_w13_shape}, got {tuple(w13_weight.shape)}."
         )
     if tuple(w2_weight.shape) != expected_w2_shape:
         raise ValueError(
-            "MoonEP PoC requires global w2_weight shape "
+            "The current SGLang MoonEP BF16 reference path requires global "
+            "w2_weight shape "
             f"{expected_w2_shape}, got {tuple(w2_weight.shape)}."
         )
 
