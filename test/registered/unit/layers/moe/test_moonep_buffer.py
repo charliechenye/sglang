@@ -18,7 +18,10 @@ from sglang.srt.layers.moe.token_dispatcher.moonep import (
     validate_moonep_reference_bf16_weight_layout,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import (
+    cleanup_distributed_resources,
+    reset_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -34,6 +37,13 @@ class _FakeMoonEPBuffer:
 
     def destroy(self):
         self.destroy_calls += 1
+
+
+class _FailOnceMoonEPBuffer(_FakeMoonEPBuffer):
+    def destroy(self):
+        self.destroy_calls += 1
+        if self.destroy_calls == 1:
+            raise RuntimeError("transient MoonEP destroy failure")
 
 
 def _fake_moonep_module():
@@ -158,11 +168,18 @@ class TestMoonEPBuffer(unittest.TestCase):
 
         self.assertEqual(_FakeMoonEPBuffer.instances, [])
 
-    def test_destroy_all_buffers_releases_cached_buffers(self):
+    def test_destroy_failure_keeps_buffer_owned_for_retry(self):
         group = object()
 
         with (
-            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch.dict(
+                sys.modules,
+                {
+                    "moonep": types.SimpleNamespace(
+                        Buffer=_FailOnceMoonEPBuffer,
+                    )
+                },
+            ),
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
                 return_value=4,
@@ -176,9 +193,15 @@ class TestMoonEPBuffer(unittest.TestCase):
                 num_max_dispatch_tokens_per_rank=256,
             )
 
-        MoonEPBuffer.destroy_all_buffers()
+            with self.assertRaisesRegex(RuntimeError, "transient MoonEP"):
+                cleanup_distributed_resources()
 
-        self.assertEqual(buffer.destroy_calls, 1)
+            self.assertIs(MoonEPBuffer.get_existing_buffer(), buffer)
+            self.assertEqual(buffer.destroy_calls, 1)
+
+            cleanup_distributed_resources()
+
+        self.assertEqual(buffer.destroy_calls, 2)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
 
 
