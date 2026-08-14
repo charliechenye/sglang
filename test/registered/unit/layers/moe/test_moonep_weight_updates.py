@@ -3,6 +3,11 @@
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.ep_moe.layer import (
+    _should_use_deepep_bf16_dispatch_fallback,
+)
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
@@ -23,6 +28,21 @@ class TestMoonEPWeightUpdateContract(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertIn("MoonEP", error)
         self.assertIn("copied expert", error)
+
+    def test_deepep_bf16_flag_does_not_divert_moonep(self):
+        with (
+            patch.object(deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+            patch.object(
+                envs.SGLANG_DEEPEP_BF16_DISPATCH,
+                "get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MOONEP,
+            ),
+        ):
+            self.assertFalse(_should_use_deepep_bf16_dispatch_fallback())
 
 
 if __name__ == "__main__":
