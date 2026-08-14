@@ -355,18 +355,23 @@ class TestMoonEPRealWeightLoaderLayout(unittest.TestCase):
 
 
 class TestMoonEPBf16ExpertRunner(unittest.TestCase):
-    def test_segment_runner_applies_expert_weights_and_route_weights(self):
+    def test_segment_runner_uses_physical_vm_group_weight_rows(self):
         hidden_states = torch.tensor(
-            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+            [[1.0, 2.0], [5.0, 6.0]],
             dtype=torch.bfloat16,
         )
-        route_weights = torch.tensor([1.0, 0.5, 2.0, 1.5], dtype=torch.float32)
-        # E=2 source rows plus B=1 physical prefetch slot.  Group 2 must use
-        # weight row 2 directly; no plan mapping is involved in the runner.
-        cu_seqlens = torch.tensor([1, 3, 4], dtype=torch.int32)
+        route_weights = torch.tensor([1.0, 1.5], dtype=torch.float32)
+        # E=2 source rows plus B=1 physical prefetch slot.  This is the
+        # planner-realistic shape for one ordinary source group, one empty
+        # source group, and one non-empty prefetch slot group.  Group 2 must
+        # use weight row 2 directly; no plan mapping is involved in the
+        # runner.
+        cu_seqlens = torch.tensor([1, 1, 2], dtype=torch.int32)
         gate = torch.tensor(
             [
                 [[1.0, 0.0], [0.0, 1.0]],
+                # Empty source row 1 is deliberately different from the
+                # controlled prefetch-slot payload in physical row 2.
                 [[0.5, 0.0], [0.0, 0.5]],
                 [[3.0, 0.0], [0.0, 3.0]],
             ],
@@ -399,13 +404,13 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
             route_weights_nvs=route_weights,
             cu_seqlens=cu_seqlens,
             plan=object(),
-            num_tokens=4,
+            num_tokens=2,
         )
 
         combine_input = run_moonep_bf16_expert(dispatch_output, layout)
 
         expected = torch.empty_like(hidden_states)
-        for start, end, physical_row in [(0, 1, 0), (1, 3, 1), (3, 4, 2)]:
+        for start, end, physical_row in [(0, 1, 0), (1, 2, 2)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
                 torch.nn.functional.silu(
@@ -418,7 +423,7 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
 
         torch.testing.assert_close(combine_input.hidden_states, expected)
         self.assertIs(combine_input.plan, dispatch_output.plan)
-        self.assertEqual(combine_input.num_tokens, 4)
+        self.assertEqual(combine_input.num_tokens, 2)
 
 
 class TestMoonEPConfigContract(unittest.TestCase):
