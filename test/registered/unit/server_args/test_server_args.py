@@ -1516,7 +1516,23 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
         self.assertEqual(resolved_view(server_args).ep_size, server_args.tp_size)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_moonep_rejects_eplb_during_dispatch_configuration(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="moonep",
+            enable_eplb=True,
+        )
+        server_args._handle_a2a_moe()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "MoonEP.*EPLB",
+        ):
+            server_args._handle_eplb_and_dispatch()
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
@@ -2207,6 +2223,11 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+    def test_moonep_rejects_two_batch_overlap(self):
+        args = self._args(moe_a2a_backend="moonep")
+        with self.assertRaisesRegex(ValueError, "MoonEP.*two-batch overlap"):
+            args._check_two_batch_overlap()
 
 
 if __name__ == "__main__":

@@ -638,8 +638,12 @@ class MoonEPDispatcher(BaseDispatcher):
         self.num_prefetch_slots = None
 
     @staticmethod
-    def _raise_unimplemented() -> NoReturn:
-        raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
+    def _raise_unimplemented(operation: str) -> NoReturn:
+        raise NotImplementedError(
+            f"The current SGLang MoonEP BF16 reference path does not implement "
+            f"{operation}. "
+            f"{_MOONEP_SPLIT_PHASE_UNSUPPORTED_MESSAGE}"
+        )
 
     def _get_buffer(self):
         if self.hidden_size is None or self.num_experts is None:
@@ -774,10 +778,10 @@ class MoonEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        self._raise_unimplemented()
+        self._raise_unimplemented("dispatch_a")
 
     def dispatch_b(self):
-        self._raise_unimplemented()
+        self._raise_unimplemented("dispatch_b")
 
     def combine(
         self,
@@ -800,10 +804,10 @@ class MoonEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ):
-        self._raise_unimplemented()
+        self._raise_unimplemented("combine_a")
 
     def combine_b(self):
-        self._raise_unimplemented()
+        self._raise_unimplemented("combine_b")
 
     def prefetch_weight(
         self,
@@ -819,4 +823,4 @@ class MoonEPDispatcher(BaseDispatcher):
         )
 
     def register_deepep_dispatch_hook(self, hook):
-        self._raise_unimplemented()
+        self._raise_unimplemented("register_deepep_dispatch_hook")
