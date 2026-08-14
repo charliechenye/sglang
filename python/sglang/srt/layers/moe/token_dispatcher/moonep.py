@@ -123,7 +123,6 @@ class MoonEPDispatchOutput(NamedTuple):
     route_weights_nvs: Optional[torch.Tensor]
     cu_seqlens: torch.Tensor
     plan: Any
-    expert_ids: torch.Tensor
     num_tokens: int
 
     @property
@@ -541,9 +540,9 @@ def run_moonep_bf16_expert(
 
     This is a correctness-first reference runner. It consumes MoonEP's already
     expert-grouped ``[NvS, H]`` token layout, applies gate/up/down expert
-    weights for each non-empty `cu_seqlens` segment, multiplies each dispatched
-    row by its route weight, and returns a `MoonEPCombineInput` for
-    `MoonEPDispatcher.combine`.
+    weights from the physical row with the same group index for each non-empty
+    `cu_seqlens` segment, multiplies each dispatched row by its route weight,
+    and returns a `MoonEPCombineInput` for `MoonEPDispatcher.combine`.
     """
 
     if activation != "silu":
@@ -556,11 +555,15 @@ def run_moonep_bf16_expert(
     hidden_states = dispatch_output.hidden_states
     route_weights_nvs = dispatch_output.route_weights_nvs
     cu_seqlens = dispatch_output.cu_seqlens
-    expert_ids = dispatch_output.expert_ids
-
     gate_weight = weight_layout.full_gate_weight
     up_weight = weight_layout.full_up_weight
     down_weight = weight_layout.full_down_weight
+    if cu_seqlens.numel() != gate_weight.shape[0]:
+        raise ValueError(
+            "MoonEP cu_seqlens must contain one physical VM-group row per "
+            "weight row: "
+            f"groups={cu_seqlens.numel()}, weight_rows={gate_weight.shape[0]}"
+        )
 
     output = torch.empty_like(hidden_states)
     prev = 0
@@ -575,18 +578,11 @@ def run_moonep_bf16_expert(
         if cur == prev:
             continue
 
-        expert_id = int(expert_ids[group_id].item())
-        if not 0 <= expert_id < gate_weight.shape[0]:
-            raise ValueError(
-                f"expert_id {expert_id} is outside MoonEP weight rows "
-                f"[0, {gate_weight.shape[0]})"
-            )
-
         x = hidden_states[prev:cur]
-        gate = F.linear(x, weight_layout.full_gate_weight[expert_id])
-        up = F.linear(x, weight_layout.full_up_weight[expert_id])
+        gate = F.linear(x, weight_layout.full_gate_weight[group_id])
+        up = F.linear(x, weight_layout.full_up_weight[group_id])
         activated = F.silu(gate) * up
-        y = F.linear(activated, weight_layout.full_down_weight[expert_id])
+        y = F.linear(activated, weight_layout.full_down_weight[group_id])
         if route_weights_nvs is not None:
             y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)
         output[prev:cur].copy_(y)
@@ -663,9 +659,6 @@ class MoonEPDispatcher(BaseDispatcher):
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             num_prefetch_slots=self.num_prefetch_slots,
         )
-
-    def _get_rank(self) -> int:
-        return dist.get_rank(group=self.group)
 
     def _validate_dispatch_inputs(
         self,
@@ -744,57 +737,6 @@ class MoonEPDispatcher(BaseDispatcher):
         )
         return tokens_per_expert.to(dtype=torch.int32)
 
-    def _expert_ids_from_plan(
-        self,
-        cu_seqlens: torch.Tensor,
-        plan: Any,
-    ) -> torch.Tensor:
-        if self.num_experts is None or self.num_experts <= 0:
-            raise ValueError(
-                "MoonEPDispatcher requires a positive num_experts, "
-                f"got {self.num_experts}."
-            )
-        if cu_seqlens.ndim != 1:
-            raise ValueError(
-                f"MoonEP cu_seqlens must be rank 1, got {cu_seqlens.shape}"
-            )
-        num_groups = int(cu_seqlens.numel())
-        if num_groups < self.num_experts:
-            raise ValueError(
-                "MoonEP cu_seqlens must contain one group per expert plus "
-                f"prefetch groups: groups={num_groups}, num_experts={self.num_experts}"
-            )
-        expert_ids = torch.full_like(cu_seqlens, -1)
-        experts_to_copy = getattr(plan, "experts_to_copy", None)
-        if not isinstance(experts_to_copy, torch.Tensor):
-            raise ValueError("MoonEP plan.experts_to_copy must be a tensor.")
-        if experts_to_copy.ndim == 2:
-            experts_to_copy = experts_to_copy[self._get_rank()]
-        elif experts_to_copy.ndim != 1:
-            raise ValueError(
-                "MoonEP plan.experts_to_copy must be rank 1 or rank 2 [R, B], "
-                f"got {experts_to_copy.shape}"
-            )
-
-        num_prefetch_slots = num_groups - self.num_experts
-        if experts_to_copy.numel() != num_prefetch_slots:
-            raise ValueError(
-                "MoonEP plan prefetch slots do not match cu_seqlens: "
-                f"plan_slots={experts_to_copy.numel()}, "
-                f"cu_seqlens_slots={num_prefetch_slots}"
-            )
-
-        prev = 0
-        for group_id in range(num_groups):
-            cur = int(cu_seqlens[group_id].item())
-            if cur > prev:
-                if group_id < self.num_experts:
-                    expert_ids[group_id] = group_id
-                else:
-                    expert_ids[group_id] = experts_to_copy[group_id - self.num_experts]
-            prev = cur
-        return expert_ids
-
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -828,7 +770,6 @@ class MoonEPDispatcher(BaseDispatcher):
             route_weights_nvs=route_weights_nvs,
             cu_seqlens=cu_seqlens,
             plan=plan,
-            expert_ids=self._expert_ids_from_plan(cu_seqlens, plan),
             num_tokens=num_tokens,
         )
 

@@ -94,6 +94,74 @@ def reference_output(hidden, topk_ids, topk_weights, gate, up, down):
     return out
 
 
+def physical_reference_output(dispatch_output, gate, up, down):
+    """Compute the dispatched rows using their physical VM-group row indices."""
+
+    hidden_states = dispatch_output.hidden_states
+    route_weights_nvs = dispatch_output.route_weights_nvs
+    cu_seqlens = dispatch_output.cu_seqlens
+    output = torch.empty_like(hidden_states)
+    prev = 0
+    for group_id in range(cu_seqlens.numel()):
+        cur = int(cu_seqlens[group_id].item())
+        if cur < prev or cur > hidden_states.shape[0]:
+            raise ValueError(
+                "MoonEP cu_seqlens must be non-decreasing and within "
+                f"dispatched rows: previous={prev}, current={cur}, "
+                f"rows={hidden_states.shape[0]}"
+            )
+        if cur == prev:
+            continue
+
+        x = hidden_states[prev:cur]
+        y = expert_mlp(x, group_id, gate, up, down)
+        if route_weights_nvs is not None:
+            y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)
+        output[prev:cur].copy_(y)
+        prev = cur
+
+    if prev < hidden_states.shape[0]:
+        output[prev:].zero_()
+    return output
+
+
+def local_experts_to_copy(plan, rank: int) -> torch.Tensor:
+    experts_to_copy = plan.experts_to_copy
+    if experts_to_copy.ndim == 2:
+        return experts_to_copy[rank]
+    if experts_to_copy.ndim == 1:
+        return experts_to_copy
+    raise ValueError(
+        "MoonEP plan.experts_to_copy must be rank 1 or rank 2 [R, B], "
+        f"got {experts_to_copy.shape}"
+    )
+
+
+def active_prefetch_slots(
+    cu_seqlens: torch.Tensor,
+    num_experts: int,
+    experts_to_copy: torch.Tensor,
+) -> list[tuple[int, int]]:
+    """Return active ``(slot, source_expert)`` pairs for this rank."""
+
+    active = []
+    prev = 0
+    for group_id in range(cu_seqlens.numel()):
+        cur = int(cu_seqlens[group_id].item())
+        if cur < prev:
+            raise ValueError(
+                "MoonEP cu_seqlens must be non-decreasing: "
+                f"previous={prev}, current={cur}"
+            )
+        if group_id >= num_experts and cur > prev:
+            slot = group_id - num_experts
+            source_expert = int(experts_to_copy[slot].item())
+            if source_expert >= 0:
+                active.append((slot, source_expert))
+        prev = cur
+    return active
+
+
 def main() -> None:
     args = parse_args()
     os.environ["SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = str(args.tokens)
@@ -129,7 +197,7 @@ def main() -> None:
         )
 
         dispatch_output = dispatcher.dispatch(hidden, topk_output)
-        num_prefetch_slots = int(dispatch_output.expert_ids.numel()) - num_experts
+        num_prefetch_slots = int(dispatch_output.cu_seqlens.numel()) - num_experts
 
         # Full global rows are deliberately replicated for this communication
         # correctness PoC. The production path should replace this with true
@@ -166,7 +234,79 @@ def main() -> None:
             num_prefetch_slots,
         )
 
+        source_gate = gate[:num_experts].clone()
+        source_up = up[:num_experts].clone()
+        source_down = down[:num_experts].clone()
+
         dispatcher.prefetch_weight(dispatch_output.plan, layout)
+
+        experts_to_copy = local_experts_to_copy(dispatch_output.plan, rank)
+        slot_rows_ok = experts_to_copy.numel() == num_prefetch_slots
+        if slot_rows_ok:
+            for slot, source_expert in enumerate(experts_to_copy.tolist()):
+                if source_expert < 0:
+                    continue
+                if source_expert >= num_experts:
+                    slot_rows_ok = False
+                    continue
+                slot_rows_ok = slot_rows_ok and torch.equal(
+                    gate[num_experts + slot], source_gate[source_expert]
+                )
+                slot_rows_ok = slot_rows_ok and torch.equal(
+                    up[num_experts + slot], source_up[source_expert]
+                )
+                slot_rows_ok = slot_rows_ok and torch.equal(
+                    down[num_experts + slot], source_down[source_expert]
+                )
+
+        # Keep the normal end-to-end check on the original prefetched layout,
+        # then probe a cloned layout.  Mutating only the clone's source rows
+        # makes a runner that bypasses physical slot rows disagree with this
+        # independent physical-row reference, while leaving the real combine
+        # inputs untouched.
+        active_slots = active_prefetch_slots(
+            dispatch_output.cu_seqlens,
+            num_experts,
+            experts_to_copy,
+        )
+        probe_gate = gate.clone()
+        probe_up = up.clone()
+        probe_down = down.clone()
+        with torch.no_grad():
+            for _slot, source_expert in active_slots:
+                probe_gate[source_expert].add_(0.5)
+                probe_up[source_expert].add_(0.75)
+                probe_down[source_expert].add_(1.0)
+        probe_layout = MoonEPExpertWeightLayout(
+            probe_gate.contiguous(),
+            probe_up.contiguous(),
+            probe_down.contiguous(),
+            num_prefetch_slots,
+        )
+        probe_combine_input = run_moonep_bf16_expert(
+            dispatch_output,
+            probe_layout,
+        )
+        probe_expected = physical_reference_output(
+            dispatch_output,
+            probe_gate,
+            probe_up,
+            probe_down,
+        )
+        probe_max_abs_err = (
+            (probe_combine_input.hidden_states.float() - probe_expected.float())
+            .abs()
+            .max()
+        )
+        probe_ok = bool(
+            torch.allclose(
+                probe_combine_input.hidden_states.float(),
+                probe_expected.float(),
+                atol=args.atol,
+                rtol=args.rtol,
+            )
+        )
+
         combine_input = run_moonep_bf16_expert(dispatch_output, layout)
         output = dispatcher.combine(combine_input)
 
@@ -182,6 +322,30 @@ def main() -> None:
             [1 if local_ok else 0], device=device, dtype=torch.int32
         )
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+        slot_rows_ok_tensor = torch.tensor(
+            [1 if slot_rows_ok else 0], device=device, dtype=torch.int32
+        )
+        dist.all_reduce(slot_rows_ok_tensor, op=dist.ReduceOp.MIN)
+        active_slot_count_tensor = torch.tensor(
+            [len(active_slots)], device=device, dtype=torch.int32
+        )
+        dist.all_reduce(active_slot_count_tensor, op=dist.ReduceOp.SUM)
+        probe_failure_tensor = torch.tensor(
+            [1 if active_slots and not probe_ok else 0],
+            device=device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(probe_failure_tensor, op=dist.ReduceOp.SUM)
+        probe_max_abs_err_tensor = probe_max_abs_err.detach().clone().float()
+        dist.all_reduce(probe_max_abs_err_tensor, op=dist.ReduceOp.MAX)
+        prefetch_slot_compute_validated = bool(
+            active_slot_count_tensor.item() > 0 and probe_failure_tensor.item() == 0
+        )
+        global_ok = bool(
+            ok_tensor.item()
+            and slot_rows_ok_tensor.item()
+            and prefetch_slot_compute_validated
+        )
 
         result = {
             "expert_compute": "reference_silu",
@@ -197,11 +361,15 @@ def main() -> None:
             "max_abs_err": float(max_abs_err.item()),
             "relative_err": float(rel_err.item()),
             "local_ok": local_ok,
-            "global_ok": bool(ok_tensor.item()),
+            "prefetch_slot_rows_verified": bool(slot_rows_ok_tensor.item()),
+            "active_prefetch_slot_groups": int(active_slot_count_tensor.item()),
+            "prefetch_slot_compute_validated": prefetch_slot_compute_validated,
+            "prefetch_probe_max_abs_err": float(probe_max_abs_err_tensor.item()),
+            "global_ok": global_ok,
         }
         print(json.dumps(result, sort_keys=True), flush=True)
         dist.barrier(device_ids=[local_rank])
-        if rank == 0 and not bool(ok_tensor.item()):
+        if rank == 0 and not global_ok:
             raise SystemExit(1)
     finally:
         # MoonEP owns VMM/NVLink resources and must be destroyed while its

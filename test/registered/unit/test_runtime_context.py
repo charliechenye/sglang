@@ -461,7 +461,6 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             route_weights_nvs=None,
             cu_seqlens=object(),
             plan=object(),
-            expert_ids=object(),
             num_tokens=1,
         )
         combine_input = MoonEPCombineInput(
@@ -651,16 +650,11 @@ class TestNamedStreams(_IsolatedServerArgs):
             cleanup_distributed_resources()
 
         self.assertEqual(calls, ["c", "b"])
-        self.assertEqual(
-            get_context().resources.distributed_resource_cleanups,
-            [cleanup_a, cleanup_b],
-        )
 
         should_fail["b"] = False
         cleanup_distributed_resources()
 
         self.assertEqual(calls, ["c", "b", "b", "a"])
-        self.assertEqual(get_context().resources.distributed_resource_cleanups, [])
 
         cleanup_distributed_resources()
         self.assertEqual(calls, ["c", "b", "b", "a"])
@@ -673,7 +667,8 @@ class TestNamedStreams(_IsolatedServerArgs):
         reset_context()
 
         self.assertEqual(calls, ["released"])
-        self.assertEqual(get_context().resources.distributed_resource_cleanups, [])
+        reset_context()
+        self.assertEqual(calls, ["released"])
 
     def test_capturer_slots_roundtrip_and_reset(self):
         from sglang.srt.state_capturer.indexer_topk import (

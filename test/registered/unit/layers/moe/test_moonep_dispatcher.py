@@ -53,8 +53,8 @@ class _FakeMoonEPBuffer:
         plan = SimpleNamespace(
             experts_to_copy=torch.tensor(
                 [
-                    list(range(10, 10 + self.num_prefetch_slots)),
-                    list(range(20, 20 + self.num_prefetch_slots)),
+                    list(range(self.num_prefetch_slots)),
+                    list(range(self.num_prefetch_slots)),
                 ],
                 dtype=torch.int32,
                 device=hidden_states.device,
@@ -100,14 +100,6 @@ class _FakeMoonEPBuffer:
 
 
 class TestMoonEPDispatcher(unittest.TestCase):
-    def setUp(self):
-        self.rank_patcher = patch(
-            "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_rank",
-            return_value=0,
-        )
-        self.rank_patcher.start()
-        self.addCleanup(self.rank_patcher.stop)
-
     def _make_dispatcher(self, *, capacity=4, num_experts=2, prefetch_slots=2):
         with envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(capacity):
             dispatcher = MoonEPDispatcher(
@@ -144,9 +136,6 @@ class TestMoonEPDispatcher(unittest.TestCase):
         with patch(
             "sglang.srt.layers.moe.token_dispatcher.moonep.MoonEPBuffer.get_moonep_buffer",
             return_value=fake_buffer,
-        ), patch(
-            "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_rank",
-            return_value=1,
         ):
             dispatch_output = dispatcher.dispatch(
                 hidden_states,
