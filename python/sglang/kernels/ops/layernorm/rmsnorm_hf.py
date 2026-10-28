@@ -25,11 +25,11 @@ def is_supported_rmsnorm_hf_hidden_size(hidden_size: int) -> bool:
 
     Two launch configs cover the practical range:
       - Warp kernel: ``[32, 512)`` in multiples of 32 (q/k RMSNorm head dims).
-      - CTA kernel: ``>= 512`` in multiples of 512 (token RMSNorms).
+      - CTA kernel: ``>= 512`` in multiples of 512, plus masked H896.
     """
     if _WARP_SIZE <= hidden_size < _CTA_BLOCK_SIZE and hidden_size % _WARP_SIZE == 0:
         return True
-    return hidden_size >= _CTA_BLOCK_SIZE and hidden_size % _CTA_BLOCK_SIZE == 0
+    return hidden_size == 896 or (hidden_size >= _CTA_BLOCK_SIZE and hidden_size % _CTA_BLOCK_SIZE == 0)
 
 
 @cache_once
@@ -68,7 +68,7 @@ def rmsnorm_hf(
         raise RuntimeError(
             f"rmsnorm_hf: unsupported hidden_size={hidden_size} "
             f"(must be a multiple of {_WARP_SIZE} in [{_WARP_SIZE}, {_CTA_BLOCK_SIZE}) "
-            f"or a multiple of {_CTA_BLOCK_SIZE})"
+            f"or a multiple of {_CTA_BLOCK_SIZE}, or 896)"
         )
     if out is None:
         out = torch.empty_like(input)
