@@ -107,7 +107,7 @@ __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFP
 #pragma unroll
   for (int k = 0; k < kElemsPerThread; ++k) {
     const int i = threadIdx.x + k * kNumThreads;
-    xi_cache[k] = static_cast<float>(xr[i]);
+    xi_cache[k] = i < kDim ? static_cast<float>(xr[i]) : 0.0f;
     lsq += xi_cache[k] * xi_cache[k];
   }
 
@@ -134,8 +134,10 @@ __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFP
 #pragma unroll
   for (int k = 0; k < kElemsPerThread; ++k) {
     const int i = threadIdx.x + k * kNumThreads;
-    const Float xn = cast<Float>(xi_cache[k] * rstd);
-    yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(wr[i]));
+    if (i < kDim) {
+      const Float xn = cast<Float>(xi_cache[k] * rstd);
+      yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(wr[i]));
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -199,7 +201,7 @@ struct HFRMSNormWarpKernel {
 template <int64_t kDim, bool kUsePDL, typename DType>
 struct HFRMSNormKernel {
   static_assert(sizeof(DType) == 2, "rmsnorm_hf: DType must be fp16_t or bf16_t");
-  static_assert(kDim >= 512 && kDim % 512 == 0, "rmsnorm_hf: kDim must be a multiple of 512");
+  static_assert(kDim == 896 || (kDim >= 512 && kDim % 512 == 0), "rmsnorm_hf: unsupported CTA hidden size");
   static constexpr auto kernel = rmsnorm_hf_scalar_kernel<kDim, kUsePDL, DType>;
   static constexpr uint32_t kBlockSize = 512;
 
