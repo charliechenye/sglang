@@ -15,6 +15,8 @@ One sync on the socket of a (trainer rank, engine rank) pair:
 from __future__ import annotations
 
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+import hashlib
+import os
 
 import msgspec
 import torch
@@ -40,10 +42,12 @@ class Write(msgspec.Struct, frozen=True):
     role: str
     # (param name, byte offset in the buffer, nbytes)
     params: List[Tuple[str, int, int]]
+    expected_sha256: Optional[Dict[str, str]] = None
 
 
 class Ack(msgspec.Struct, frozen=True):
     error: Optional[str]
+    received_sha256: Optional[Dict[str, str]] = None
 
 
 class End(msgspec.Struct, frozen=True):
@@ -84,7 +88,12 @@ def pull_param_bytes(
                 published_nbytes_by_role=published_nbytes_by_role,
                 written_names_by_role=written_names_by_role,
             )
-        sock.send_pyobj(Ack(error))
+        received_sha256 = None
+        if error is None and write.expected_sha256 is not None:
+            received_sha256 = _readback_digests(write, params_by_role)
+            if received_sha256 != write.expected_sha256:
+                error = f"D7 receiver byte digest mismatch in {write.role}"
+        sock.send_pyobj(Ack(error, received_sha256))
     del buffers
     torch.cuda.ipc_collect()
     if error is None:
@@ -141,3 +150,13 @@ def _unwritten_params_error(
         if unwritten:
             return f"{role}: {len(unwritten)} params the loader writes got no bytes this sync, e.g. {unwritten[:5]}"
     return None
+
+
+def _readback_digests(write: Write, params_by_role: Dict[str, Dict[str, torch.nn.Parameter]]) -> Dict[str, str]:
+    """Opt-in D7: read actual *destination storage bytes* after the copy's stream sync."""
+    params = params_by_role[write.role]
+    result = {}
+    for name, _, nbytes in write.params:
+        raw = _published_byte_range(param=params[name], nbytes=nbytes)
+        result[name] = hashlib.sha256(raw.cpu().numpy().tobytes()).hexdigest()
+    return result
