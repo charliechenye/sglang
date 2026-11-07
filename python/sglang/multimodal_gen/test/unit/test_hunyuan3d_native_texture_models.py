@@ -25,6 +25,11 @@ from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     StableDiffusionUNetConfig,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.models.vaes.hunyuan3d_vae import (
+    CrossAttentionDecoder,
+    FourierEmbedder,
+    VanillaVolumeDecoder,
+)
 from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
     Hunyuan3D2Pipeline,
 )
@@ -374,6 +379,39 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
                 np.testing.assert_array_equal(
                     actual.view(np.uint64), reference.view(np.uint64)
                 )
+
+
+class TestHunyuan3DShapeKV(unittest.TestCase):
+    def test_volume_decoder_reuses_kv_without_cross_request_staleness(self):
+        torch.manual_seed(73)
+        for downsample_ratio in (1, 2):
+            with self.subTest(downsample_ratio=downsample_ratio):
+                decoder = CrossAttentionDecoder(
+                    num_latents=8,
+                    out_channels=1,
+                    fourier_embedder=FourierEmbedder(num_freqs=2),
+                    width=16,
+                    heads=4,
+                    downsample_ratio=downsample_ratio,
+                    qk_norm=True,
+                ).eval()
+                volume = VanillaVolumeDecoder()
+                for request in range(2):
+                    latents = torch.randn(1, 8, 16 * downsample_ratio)
+                    kwargs = {
+                        "bounds": 1.01,
+                        "octree_resolution": 3,
+                        "num_chunks": 7,
+                        "enable_pbar": False,
+                    }
+                    with torch.no_grad():
+                        reference = volume(
+                            latents, lambda **inputs: decoder(**inputs), **kwargs
+                        )
+                        optimized = volume(latents, decoder, **kwargs)
+                    torch.testing.assert_close(
+                        optimized, reference, rtol=0, atol=0
+                    )
 
 
 if __name__ == "__main__":

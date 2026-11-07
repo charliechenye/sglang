@@ -270,9 +270,11 @@ class MultiheadCrossAttention(nn.Module):
         self.kv_cache = kv_cache
         self.data = None
 
-    def forward(self, x, data):
+    def forward(self, x, data, *, prepared_kv=None):
         x = self.c_q(x)
-        if self.kv_cache:
+        if prepared_kv is not None:
+            data = prepared_kv
+        elif self.kv_cache:
             if self.data is None:
                 self.data = self.c_kv(data)
                 logger.info(
@@ -318,8 +320,10 @@ class ResidualCrossAttentionBlock(nn.Module):
         self.ln_3 = norm_layer(width, elementwise_affine=True, eps=1e-6)
         self.mlp = MLP(width=width, expand_ratio=mlp_expand_ratio)
 
-    def forward(self, x: torch.Tensor, data: torch.Tensor):
-        x = x + self.attn(self.ln_1(x), self.ln_2(data))
+    def forward(self, x: torch.Tensor, data: torch.Tensor, *, prepared_kv=None):
+        if prepared_kv is None:
+            data = self.ln_2(data)
+        x = x + self.attn(self.ln_1(x), data, prepared_kv=prepared_kv)
         x = x + self.mlp(self.ln_3(x))
         return x
 
@@ -511,15 +515,26 @@ class CrossAttentionDecoder(nn.Module):
     def set_cross_attention_processor(self, processor):
         self.cross_attn_decoder.attn.attention.attn_processor = processor
 
-    def forward(self, queries=None, query_embeddings=None, latents=None):
+    def prepare_kv(self, latents):
+        """Build request-local projected K/V once for all volume chunks."""
+        if self.downsample_ratio != 1:
+            latents = self.latents_proj(latents)
+        block = self.cross_attn_decoder
+        return block.attn.c_kv(block.ln_2(latents))
+
+    def forward(
+        self, queries=None, query_embeddings=None, latents=None, *, prepared_kv=None
+    ):
         if query_embeddings is None:
             fourier_out = self.fourier_embedder(queries)
             query_embeddings = self.query_proj(fourier_out.to(latents.dtype))
 
-        if self.downsample_ratio != 1:
+        if self.downsample_ratio != 1 and prepared_kv is None:
             latents = self.latents_proj(latents)
 
-        x = self.cross_attn_decoder(query_embeddings, latents)
+        x = self.cross_attn_decoder(
+            query_embeddings, latents, prepared_kv=prepared_kv
+        )
 
         if self.enable_ln_post:
             x = self.ln_post(x)
@@ -643,6 +658,12 @@ class VanillaVolumeDecoder:
         xs, ys, zs = torch.meshgrid(x, y, z, indexing="ij")
         xyz_samples = torch.stack((xs, ys, zs), dim=-1).reshape(-1, 3)
 
+        # This cache belongs to this invocation, never to the model or worker.
+        prepared_kv = (
+            geo_decoder.prepare_kv(latents)
+            if isinstance(geo_decoder, CrossAttentionDecoder)
+            else None
+        )
         batch_logits = []
         for start in tqdm(
             range(0, xyz_samples.shape[0], num_chunks),
@@ -651,7 +672,12 @@ class VanillaVolumeDecoder:
         ):
             chunk_queries = xyz_samples[start : start + num_chunks, :]
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
-            logits = geo_decoder(queries=chunk_queries, latents=latents)
+            if prepared_kv is None:
+                logits = geo_decoder(queries=chunk_queries, latents=latents)
+            else:
+                logits = geo_decoder(
+                    queries=chunk_queries, latents=latents, prepared_kv=prepared_kv
+                )
             batch_logits.append(logits)
 
         grid_logits = torch.cat(batch_logits, dim=1)
