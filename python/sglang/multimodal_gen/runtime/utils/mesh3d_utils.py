@@ -878,19 +878,23 @@ class MeshRender:
 
         # Shrink visible mask
         kernel_size = self.bake_unreliable_kernel_size * 2 + 1
-        kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=torch.float32).to(
-            sketch_image.device
-        )
-
         visible_mask_proc = visible_mask.permute(2, 0, 1).unsqueeze(0).float()
-        visible_mask_proc = F.conv2d(
-            1.0 - visible_mask_proc, kernel, padding=kernel_size // 2
+        visible_mask_proc = F.max_pool2d(
+            1.0 - visible_mask_proc,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
         )
         visible_mask_proc = 1.0 - (visible_mask_proc > 0).float()
         visible_mask_proc = visible_mask_proc.squeeze(0).permute(1, 2, 0)
 
         sketch_proc = sketch_image.permute(2, 0, 1).unsqueeze(0)
-        sketch_proc = F.conv2d(sketch_proc, kernel, padding=kernel_size // 2)
+        sketch_proc = F.max_pool2d(
+            sketch_proc,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+        )
         sketch_proc = (sketch_proc > 0).float()
         sketch_proc = sketch_proc.squeeze(0).permute(1, 2, 0)
         visible_mask_proc = visible_mask_proc * (sketch_proc < 0.5)

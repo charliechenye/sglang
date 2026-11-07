@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from torch.nn import functional as F
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
@@ -49,6 +50,49 @@ def test_image_processor_accepts_ndarray_like_pil(channels):
 def test_image_processor_rejects_unsupported_input_type():
     with pytest.raises(TypeError, match="Unsupported image type"):
         ImageProcessorV2(size=8).load_image(torch.zeros(3, 8, 8))
+
+
+@pytest.mark.parametrize("kernel_size", [1, 3, 5, 17])
+def test_mask_shrink_max_pool_matches_all_ones_convolution(kernel_size):
+    """For nonnegative values, all-ones sums and maxs agree on positivity."""
+    shape = (1, 1, 19, 21)
+    zeros = torch.zeros(shape)
+    ones = torch.ones(shape)
+
+    sparse = torch.zeros(shape)
+    sparse[0, 0, 9, 10] = 0.25
+    sparse[0, 0, 4, 7] = 1.0
+
+    corners = torch.zeros(shape)
+    corners[0, 0, 0, 0] = 0.25
+    corners[0, 0, 0, -1] = 0.5
+    corners[0, 0, -1, 0] = 0.75
+    corners[0, 0, -1, -1] = 1.0
+
+    random_values = torch.rand(shape, generator=torch.Generator().manual_seed(0))
+    inputs = [
+        ("zeros", zeros),
+        ("ones", ones),
+        ("sparse", sparse),
+        ("corners", corners),
+        ("random", random_values),
+    ]
+    kernel = torch.ones((1, 1, kernel_size, kernel_size))
+
+    for name, tensor in inputs:
+        conv_positive = F.conv2d(tensor, kernel, padding=kernel_size // 2) > 0
+        max_pool_positive = (
+            F.max_pool2d(
+                tensor,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=kernel_size // 2,
+            )
+            > 0
+        )
+        assert torch.equal(conv_positive, max_pool_positive), (
+            f"Mismatch for {name=} with {kernel_size=}"
+        )
 
 
 # Distinct value per sample, frame and channel, so swapped axes change the result.
